@@ -3,9 +3,41 @@ __pycache__
 *.pyc
 *.egg-info
 
+# 虚拟环境
+.venv
+venv
+env
+ENV
+virtualenv/
+
 # Log
 *.log
 *.log.*
+
+# 模型文件 - 直接忽略整个模型文件夹
+llava-v1.5-7b/
+clip-vit-large-patch14-336/
+**/llava-v1.5-7b/
+**/clip-vit-large-patch14-336/
+
+# 常见的模型文件扩展名
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+
+# Data
+UCIT/
+UCIT/*
+**/UCIT/
+**/UCIT/*
+*.data
+*.csv
+*.json
 
 # Other
 .DS_Store
