@@ -19,6 +19,7 @@ llava-v1.5-7b/
 clip-vit-large-patch14-336/
 **/llava-v1.5-7b/
 **/clip-vit-large-patch14-336/
+description_cache/
 
 # 常见的模型文件扩展名
 *.pt
