@@ -1,317 +1,511 @@
 import torch
+
 import torch.nn as nn
+
 import torch.nn.functional as F
+
 from transformers import Trainer
+
 import os
-import json
+
+
 
 class ContinualLoRATrainer(Trainer):
+
     """
-    支持持续学习的Trainer，包含三部分loss
-    
-    损失函数构成：
-    1. hidden_loss: 加LoRA后模型的hidden state与不加LoRA的hidden state尽量相似
-    2. text_qa_loss: question + description -> answer (使用自然语言description)
-    3. vision_qa_loss: image + question -> answer (多模态路径)
-    
-    优化：description以自然语言形式保存，避免重复计算
+
+    重构版支持持续学习的 Trainer
+
+    改进：移除不可靠的缓存机制，增强多图片批处理的稳定性
+
     """
-    def __init__(self, 
-                 lora_config=None, 
-                 loss_weights=None, 
+
+    def __init__(self,
+
+                 lora_config=None,
+
+                 loss_weights=None,
+
                  layer_idx=-10,
+
                  description_prompt=None,
-                 description_cache_dir=None,  # 新增：description缓存目录
+
+                 description_cache_dir=None,
+
                  **kwargs):
-        
-        # 保存参数
+
+       
+
         self.description_prompt = description_prompt or "Please describe this image in detail"
+
         self.layer_idx = layer_idx
+
         self.description_cache_dir = description_cache_dir or "./description_cache"
-        
-        # 创建缓存目录
+
         os.makedirs(self.description_cache_dir, exist_ok=True)
-        
+
+       
+
         self.loss_weights = loss_weights or {
+
             'hidden': 0.2,
+
             'text_qa': 0.3,
+
             'vision_qa': 0.5
+
         }
-        
-        # 先初始化Trainer
+
+       
+
         super().__init__(**kwargs)
-        
-        # LoRA配置
+
+       
+
         self.lora_config = lora_config or {
-            'r': 8, 
-            'alpha': 16, 
+
+            'r': 8,
+
+            'alpha': 16,
+
             'target_modules': ['v_proj'],
+
             'mm_projector': True,
+
             'dropout': 0.05
+
         }
-        
-        # 用LoRA包装模型
-        print("正在用LoRA包装模型...")
+
+       
+
+        # 包装模型
+
         from peft.llava_lora import LLaVAWithLoRA
-        self.model = LLaVAWithLoRA(self.model, self.lora_config)
-        print("模型包装完成")
-        
-        # description缓存字典
+
+        if not isinstance(self.model, LLaVAWithLoRA):
+
+            print("正在用 LoRA 包装模型...")
+
+            self.model = LLaVAWithLoRA(self.model, self.lora_config)
+
+        else:
+
+            print("模型已经是 LLaVAWithLoRA 包装状态。")
+
+
+
+        if hasattr(self.model, "gradient_checkpointing_enable"):
+
+            self.model.gradient_checkpointing_enable()
+
+           
+
         self.description_cache = {}
+
         self._load_cache()
-    
+
+
+
     def _get_cache_path(self, image_path):
-        """获取缓存文件路径"""
-        # 将image_path转换为安全的文件名
+
         safe_name = image_path.replace('/', '_').replace('\\', '_')
+
         return os.path.join(self.description_cache_dir, f"{safe_name}.txt")
-    
+
+
+
     def _load_cache(self):
-        """加载已有的description缓存"""
+
         if os.path.exists(self.description_cache_dir):
+
             for f in os.listdir(self.description_cache_dir):
+
                 if f.endswith('.txt'):
+
                     cache_path = os.path.join(self.description_cache_dir, f)
-                    with open(cache_path, 'r') as file:
-                        image_key = f[:-4]  # 去掉.txt后缀
+
+                    with open(cache_path, 'r', encoding='utf-8') as file:
+
+                        image_key = f[:-4]
+
                         self.description_cache[image_key] = file.read()
-            print(f"加载了 {len(self.description_cache)} 条description缓存")
-    
+
+            print(f"加载了 {len(self.description_cache)} 条 description 缓存")
+
+
+
     def _save_description_to_cache(self, image_path, description):
-        """保存description到缓存文件"""
+
         cache_path = self._get_cache_path(image_path)
-        with open(cache_path, 'w') as f:
+
+        with open(cache_path, 'w', encoding='utf-8') as f:
+
             f.write(description)
-        # 同时更新内存缓存
+
         safe_key = image_path.replace('/', '_').replace('\\', '_')
+
         self.description_cache[safe_key] = description
-    
+
+
+
+    @torch.no_grad()
+
     def generate_description(self, model, image, image_path=None):
-        """
-        使用原始模型生成自然语言description
-        只运行一次，结果会被缓存
-        
-        Args:
-            model: 原始模型（不带LoRA）
-            image: 输入图像
-            image_path: 图像路径，用于缓存
-        """
-        # 如果有缓存且提供了image_path，直接返回缓存的description
+
+        """离线生成描述，强制切换模式"""
+
         if image_path is not None:
+
             safe_key = image_path.replace('/', '_').replace('\\', '_')
+
             if safe_key in self.description_cache:
+
                 return self.description_cache[safe_key]
-        
-        # 构建description prompt
+
+       
+
+        orig_mode = model.training
+
+        model.eval()
+
+        if hasattr(model, 'set_lora_active'):
+
+            model.set_lora_active(False)
+
+       
+
         prompt = f"USER: {self.description_prompt}\nASSISTANT:"
-        
-        # 使用tokenizer处理prompt
-        inputs = self.tokenizer(
-            prompt,
-            return_tensors="pt",
-            padding=True,
-            truncation=True
-        ).to(model.device)
-        
-        # 生成description
-        with torch.no_grad():
-            # 不使用LoRA生成
-            if hasattr(model, 'set_lora_active'):
-                model.set_lora_active(False)
-            
-            # 生成文本
-            generated_ids = model.generate(
-                input_ids=inputs['input_ids'],
-                images=image.unsqueeze(0) if image is not None else None,
-                max_new_tokens=100,
-                do_sample=False,
-                num_beams=1
-            )
-            
-            # 解码
-            description = self.tokenizer.decode(
-                generated_ids[0][inputs['input_ids'].shape[1]:],
-                skip_special_tokens=True
-            )
-            
-            # 恢复LoRA状态
-            if hasattr(model, 'set_lora_active'):
-                model.set_lora_active(True)
-        
-        # 保存到缓存
+
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(model.device)
+
+
+
+        generated_ids = model.generate(
+
+            inputs=inputs['input_ids'],
+
+            images=image.unsqueeze(0) if image is not None else None,
+
+            max_new_tokens=100,
+
+            do_sample=False
+
+        )
+
+       
+
+        description = self.tokenizer.decode(
+
+            generated_ids[0][inputs['input_ids'].shape[1]:],
+
+            skip_special_tokens=True
+
+        ).strip()
+
+       
+
+        if hasattr(model, 'set_lora_active'):
+
+            model.set_lora_active(True)
+
+        model.train(orig_mode)
+
+       
+
         if image_path is not None:
+
             self._save_description_to_cache(image_path, description)
-        
+
         return description
-    
-    def get_hidden_state(self, model, input_ids, images, use_lora=True):
-        """
-        获取指定层的hidden state
-        通过use_lora参数控制是否使用LoRA
-        """
-        device = next(model.parameters()).device
-        
-        if input_ids.device != device:
-            input_ids = input_ids.to(device)
-        if images is not None and isinstance(images, torch.Tensor) and images.device != device:
-            images = images.to(device)
-        
-        with torch.no_grad() if not use_lora else torch.enable_grad():
-            outputs = model(
-                input_ids=input_ids,
-                images=images,
-                output_hidden_states=True,
-                use_lora=use_lora
-            )
-            hidden_states = outputs.hidden_states[self.layer_idx]
-            description_hidden = hidden_states.mean(dim=1)
-        
-        return description_hidden
-    
+
+
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        """
-        计算三部分loss
-        """
+
+        target_dtype = next(model.parameters()).dtype
+
         device = next(model.parameters()).device
-        
-        # 获取输入
+
+        print(inputs)
+
+        exit(0)
+
         images = inputs.get('images')
+
+        if images is not None:
+
+            images = images.to(device=device, dtype=target_dtype)
+
+           
+
         input_ids = inputs.get('input_ids')
+
         labels = inputs.get('labels')
-        image_paths = inputs.get('image_paths')  # 用于缓存key
-        
-        # 将输入移动到正确的设备
-        if input_ids.device != device:
-            input_ids = input_ids.to(device)
-        if labels is not None and labels.device != device:
-            labels = labels.to(device)
-        
-        # 1. Hidden state对比损失（保持不变）
-        h_without_lora = self.get_hidden_state(
-            model, input_ids, images, use_lora=False
-        ).detach()
-        
-        h_with_lora = self.get_hidden_state(
-            model, input_ids, images, use_lora=True
-        )
-        
-        loss_hidden = F.mse_loss(h_with_lora, h_without_lora)
-        
-        # 2. 多模态路径损失 (image + question -> answer)
+
+        image_paths = inputs.get('image_paths')
+
+
+
+        # 检查是否使用了 DataParallel 等包装
+
+        raw_model = model.module if hasattr(model, 'module') else model
+
+
+
+        # --- 步骤 1: 实时获取 Base Model 的 Hidden State (去缓存版) ---
+
+        with torch.no_grad():
+
+            # 记录当前模式
+
+            orig_training_mode = raw_model.training
+
+            raw_model.eval() # 切换到 eval 模式以获得稳定的特征
+
+           
+
+            if hasattr(raw_model, 'set_lora_active'):
+
+                raw_model.set_lora_active(False) # 临时禁用 LoRA
+
+           
+
+            outputs_base = raw_model(
+
+                input_ids=input_ids,
+
+                images=images,
+
+                output_hidden_states=True,
+
+                return_dict=True
+
+            )
+
+            # 提取基准特征并断开梯度
+
+            h_without_lora = outputs_base.hidden_states[self.layer_idx].mean(dim=1).detach()
+
+           
+
+            # 恢复训练模式
+
+            if hasattr(raw_model, 'set_lora_active'):
+
+                raw_model.set_lora_active(True)
+
+            raw_model.train(orig_training_mode)
+
+
+
+        # --- 步骤 2: 多模态前向传播 (带梯度) ---
+
+        # 显式确保 LoRA 激活
+
+        if hasattr(raw_model, 'set_lora_active'):
+
+            raw_model.set_lora_active(True)
+
+
+
         outputs_vision = model(
+
             input_ids=input_ids,
+
             images=images,
+
             labels=labels,
-            use_lora=True,
-            output_hidden_states=False
+
+            output_hidden_states=True,
+
+            return_dict=True
+
         )
+
         loss_vision = outputs_vision.loss
-        
-        # 3. 文本路径损失 (description + question -> answer)
+
+        h_with_lora = outputs_vision.hidden_states[self.layer_idx].mean(dim=1)
+
+       
+
+        # 计算 Hidden 损失
+
+        loss_hidden = torch.nn.functional.mse_loss(h_with_lora.float(), h_without_lora.float())
+
+
+
+        # --- 步骤 3: 文本路径损失 ---
+
         loss_text = torch.tensor(0.0).to(device)
-        
-        if images is not None and image_paths is not None:
-            # 为batch中的每个图像生成description
-            descriptions = []
-            for i, img_path in enumerate(image_paths):
-                # 使用原始模型（不带LoRA）生成description
-                if isinstance(images, list):
-                    # images是PIL图像列表
-                    desc = self.generate_description(
-                        self.model.base_model,  # 使用原始模型
-                        images[i] if i < len(images) else None,
-                        img_path
-                    )
-                else:
-                    # images是tensor，需要处理
-                    desc = self.generate_description(
-                        self.model.base_model,
-                        images[i] if images is not None else None,
-                        img_path
-                    )
-                descriptions.append(desc)
-            
-            # 构建description+question的输入
-            # 这里需要根据你的数据格式构造新的input_ids
-            # 假设inputs中包含了原始问题questions
-            if 'questions' in inputs:
-                text_inputs = self._build_text_inputs(
-                    descriptions, 
+
+        if images is not None and image_paths is not None and 'questions' in inputs:
+
+            # 提取对话中的回答
+
+            answers_text = inputs.get('answers', None)
+
+            if answers_text is None and labels is not None:
+
+                answers_text = []
+
+                for label_tensor in labels:
+
+                    valid_ids = label_tensor[label_tensor >= 0]
+
+                    decoded_text = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+
+                    answers_text.append(decoded_text)
+
+           
+
+            if answers_text and len(answers_text) > 0:
+
+                # 实时生成图片描述
+
+                descriptions = [self.generate_description(raw_model, images[i], img_path)
+
+                               for i, img_path in enumerate(image_paths)]
+
+               
+
+                text_input_ids, text_labels = self._build_text_inputs_and_labels(
+
+                    descriptions,
+
                     inputs['questions'],
+
+                    answers_text,
+
                     device
+
                 )
-                
-                # 计算文本路径的loss
-                outputs_text = model(
-                    input_ids=text_inputs,
-                    images=None,  # 不输入图像
-                    labels=labels,  # 注意：labels可能需要调整
-                    use_lora=True,
-                    output_hidden_states=False
+
+               
+
+                # 文本路径前向传播 (绕过多模态 Projector)
+
+                from llava.model.language_model.llava_llama import LlavaLlamaForCausalLM
+
+                outputs_text = super(LlavaLlamaForCausalLM, raw_model).forward(
+
+                    input_ids=text_input_ids,
+
+                    labels=text_labels,
+
+                    images=None,
+
+                    attention_mask=None
+
                 )
+
                 loss_text = outputs_text.loss if outputs_text.loss is not None else loss_text
-        
-        # 加权组合
+
+           
+
+        # 损失加权汇总
+
         total_loss = (
-            self.loss_weights['hidden'] * loss_hidden +
+
+           # self.loss_weights['hidden'] * loss_hidden +
+
             self.loss_weights['text_qa'] * loss_text +
+
             self.loss_weights['vision_qa'] * loss_vision
+
         )
-        
-        # 打印loss
-        if self.state.global_step % 100 == 0:
-            print(f"\nStep {self.state.global_step}:")
-            print(f"  hidden_loss: {loss_hidden.item():.4f}")
-            print(f"  text_qa_loss: {loss_text.item():.4f}")
-            print(f"  vision_qa_loss: {loss_vision.item():.4f}")
-            print(f"  total_loss: {total_loss.item():.4f}")
-        
+
+
+
+        # 调试打印 (建议每步打印直到确认收敛)
+
+        if self.state.global_step % 1 == 0:
+
+            print(f"Step {self.state.global_step} | Total Loss: {total_loss.item():.4f} | Hidden: {loss_hidden.item():.4f} | Vision: {loss_vision.item():.4f} | Text: {loss_text.item():.4f}")
+
+
+
         return (total_loss, outputs_vision) if return_outputs else total_loss
-    
-    def _build_text_inputs(self, descriptions, questions, device):
-        """
-        构建纯文本输入：description + question
-        """
-        batch_texts = []
-        for desc, q in zip(descriptions, questions):
-            # 构建prompt：先描述图像，再问问题
-            text = f"USER: The image shows: {desc}\nQuestion: {q}\nASSISTANT:"
-            batch_texts.append(text)
-        
-        # tokenize
-        inputs = self.tokenizer(
-            batch_texts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=self.tokenizer.model_max_length
+
+
+
+    def _build_text_inputs_and_labels(self, descs, questions, answers, device):
+
+        tokenizer = self.tokenizer
+
+        full_input_ids = []
+
+        full_labels = []
+
+
+
+        for d, q, a in zip(descs, questions, answers):
+
+            prompt = f"USER: Description: {d}\nQuestion: {q}\nASSISTANT:"
+
+            full_text = f"{prompt} {a}{tokenizer.eos_token}"
+
+           
+
+            input_ids = tokenizer(full_text, return_tensors="pt", add_special_tokens=False).input_ids[0]
+
+            prompt_ids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids[0]
+
+           
+
+            labels = input_ids.clone()
+
+            labels[:len(prompt_ids)] = -100 # Mask 掉 Prompt
+
+           
+
+            full_input_ids.append(input_ids)
+
+            full_labels.append(labels)
+
+
+
+        # Padding
+
+        text_input_ids = torch.nn.utils.rnn.pad_sequence(
+
+            full_input_ids, batch_first=True, padding_value=tokenizer.pad_token_id
+
         ).to(device)
-        
-        return inputs['input_ids']
-    
+
+       
+
+        text_labels = torch.nn.utils.rnn.pad_sequence(
+
+            full_labels, batch_first=True, padding_value=-100
+
+        ).to(device)
+
+
+
+        return text_input_ids, text_labels
+
+
+
     def on_task_end(self):
-        """
-        每个任务结束时调用
-        """
-        print(f"\n{'='*50}")
-        print("任务结束，正在合并LoRA...")
-        
-        # 合并LoRA权重
-        self.model.merge_all_lora()
-        
-        # 重置LoRA
-        print("重置LoRA，准备下一个任务...")
+
+        """任务结束处理：合并 LoRA 并清理资源"""
+
+        print("\n" + "="*30 + " 任务结束：合并并重置 LoRA " + "="*30)
+
+       
+
+        if hasattr(self.model, 'merge_all_lora'):
+
+            self.model.merge_all_lora()
+
+           
+
         if hasattr(self.model, 'reset_lora'):
+
             self.model.reset_lora()
-        
-        # 清理GPU缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-        
-        # 保存description缓存索引（可选）
-        cache_index = os.path.join(self.description_cache_dir, "cache_index.json")
-        with open(cache_index, 'w') as f:
-            json.dump(list(self.description_cache.keys()), f)
-        
-        print(f"任务完成，模型已更新，description缓存保存在: {self.description_cache_dir}")
-        print(f"{'='*50}\n")
+
+           
+
+        torch.cuda.empty_cache()
+
+        print("="*80 + "\n")

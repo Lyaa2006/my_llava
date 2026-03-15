@@ -68,8 +68,9 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         images: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
+        **kwargs
     ) -> Union[Tuple, CausalLMOutputWithPast]:
-
+        
         if inputs_embeds is None:
             (
                 input_ids,
@@ -113,7 +114,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         attention_mask = kwargs.pop("attention_mask", None)
         if "inputs_embeds" in kwargs:
             raise NotImplementedError("`inputs_embeds` is not supported")
-
+        
         if images is not None:
             (
                 inputs,

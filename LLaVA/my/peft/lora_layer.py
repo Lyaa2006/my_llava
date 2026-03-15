@@ -1,71 +1,74 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import math
 
 class LoRALayer(nn.Module):
     """
-    标准的LoRA层：W_new = W_old + B @ A
-    可以动态控制是否使用LoRA
+    标准的LoRA层：W_new = W_old + (B @ A) * scaling
+    针对持续学习优化：支持显式权重合并与参数重置
     """
     def __init__(self, original_layer, r=8, alpha=16, dropout=0.1):
         super().__init__()
+        
+        if not isinstance(original_layer, nn.Linear):
+            raise ValueError(f"LoRALayer 目前仅支持 nn.Linear 层，收到: {type(original_layer)}")
+
         self.original_layer = original_layer
         self.r = r
         self.alpha = alpha
         self.scaling = alpha / r
-        self.use_lora = True  # 控制是否使用LoRA
-        
-        # 获取原始层的维度
-        if isinstance(original_layer, nn.Linear):
-            self.in_features = original_layer.in_features
-            self.out_features = original_layer.out_features
-        else:
-            raise ValueError(f"只支持Linear层，但得到了{type(original_layer)}")
-        
-        # 冻结原始层
+        self.use_lora = True  # 全局开关
+
+        # 1. 冻结原始层参数
         for param in self.original_layer.parameters():
             param.requires_grad = False
             
-        # LoRA参数
-        self.lora_A = nn.Parameter(
-            torch.zeros(self.r, self.in_features)
-        )
-        self.lora_B = nn.Parameter(
-            torch.zeros(self.out_features, self.r)
-        )
+        # 2. 定义 LoRA 参数
+        # 我们使用 original_layer 的 dtype 和 device 来初始化，避免后续 forward 中的转换
+        factory_kwargs = {'device': original_layer.weight.device, 'dtype': original_layer.weight.dtype}
+        
+        self.lora_A = nn.Parameter(torch.empty((r, original_layer.in_features), **factory_kwargs))
+        self.lora_B = nn.Parameter(torch.empty((original_layer.out_features, r), **factory_kwargs))
         self.dropout = nn.Dropout(dropout)
         
-        # 初始化A (Kaiming初始化)，B保持为零
+        # 3. 初始化参数
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        """
+        重置 LoRA 参数：A 使用 Kaiming 初始化，B 清零。
+        这确保了任务开始时 LoRA 分支对原始权重的干扰为 0。
+        """
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        # B已经是零
-        
-    def forward(self, x):
-        # 原始前向
-        original_output = self.original_layer(x)
-        
-        if self.use_lora:
-            # LoRA分支: x @ A^T @ B^T
-            # 注意维度：x: [batch, seq_len, in_features]
-            # lora_A: [r, in_features] -> A^T: [in_features, r]
-            # lora_B: [out_features, r] -> B^T: [r, out_features]
-            lora_output = (self.dropout(x) @ self.lora_A.T) @ self.lora_B.T
-            return original_output + self.scaling * lora_output
-        else:
-            return original_output
-    
+        nn.init.zeros_(self.lora_B)
+
     def merge_lora(self):
         """
-        将LoRA参数合并回原始层
-        训练完一个task后调用
+        将当前任务学到的 Delta W 合并回 original_layer 的权重中。
         """
-        if isinstance(self.original_layer, nn.Linear):
-            # W_new = W_old + B @ A * scaling
-            merged_weight = self.original_layer.weight.data + \
-                           self.scaling * (self.lora_B @ self.lora_A)
-            self.original_layer.weight.data = merged_weight
+        with torch.no_grad():
+            # W = W + (B @ A) * scaling
+            delta_w = (self.lora_B @ self.lora_A) * self.scaling
+            self.original_layer.weight.data.add_(delta_w)
+            # 合并后通常需要重置 B，防止在 forward 中重复叠加已沉淀的知识
+            nn.init.zeros_(self.lora_B)
+
+    def forward(self, x):
+        # 原始权重输出
+        result = self.original_layer(x)
+        
+        if self.use_lora:
+            # 这里的计算会自动跟随 x 的精度和设备，前提是初始化时已对齐
+            # 避免在 forward 中调用 .to()，那会导致严重的性能瓶颈
             
-            # 清零LoRA参数，为下一个任务准备
-            self.lora_A.data.zero_()
-            self.lora_B.data.zero_()
-            print(f"LoRA merged into original layer")
+            # 分支路径: x -> dropout -> A -> B -> scaling
+            x_dtype = x.dtype
+            # 确保 LoRA 计算在混合精度下也是安全的
+            lora_out = (self.dropout(x) @ self.lora_A.transpose(0, 1)) @ self.lora_B.transpose(0, 1)
+            
+            result += lora_out * self.scaling
+            
+        return result
+
+    def extra_repr(self) -> str:
+        return f"in_features={self.original_layer.in_features}, out_features={self.original_layer.out_features}, r={self.r}, alpha={self.alpha}"
