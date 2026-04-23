@@ -16,18 +16,19 @@
 
 import os
 import copy
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-import json
+import json, deepspeed
 import logging
-import pathlib
+import pathlib, random
 from typing import Dict, Optional, Sequence, List
 
 import torch
-
 import transformers
-import tokenizers
+import subprocess
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from peft.utils import WEIGHTS_NAME, set_peft_model_state_dict
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -35,8 +36,9 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
-from PIL import Image
-
+from PIL import Image, ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+Image.MAX_IMAGE_PIXELS=None
 
 local_rank = None
 
@@ -46,13 +48,10 @@ def rank0_print(*args):
         print(*args)
 
 
-from packaging import version
-IS_TOKENIZER_GREATER_THAN_0_14 = version.parse(tokenizers.__version__) >= version.parse('0.14')
-
-
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    previous_task_model_path: Optional[str] = field(default=None)
     version: Optional[str] = field(default="v0")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
@@ -62,7 +61,6 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default='linear')
     mm_use_im_start_end: bool = field(default=False)
     mm_use_im_patch_token: bool = field(default=True)
-    mm_patch_merge_type: Optional[str] = field(default='flat')
     mm_vision_select_feature: Optional[str] = field(default="patch")
 
 
@@ -70,6 +68,10 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None,
                            metadata={"help": "Path to the training data."})
+    memory_data_path: str = field(default=None,
+                           metadata={"help": "Path to the memory data."})
+    description_prompt: str = field(default="please describe this picture")
+    description_cache_dir: Optional[str] = field(default=None)
     lazy_preprocess: bool = False
     is_multimodal: bool = False
     image_folder: Optional[str] = field(default=None)
@@ -110,6 +112,15 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     mm_projector_lr: Optional[float] = None
     group_by_modality_length: bool = field(default=False)
+    is_SAT: bool = field(default=False,
+                         metadata={"help":"whether SAT data (different group_by_modality_length)"})
+    enable_description_cl: bool = field(default=False)
+    extract_description_cache_only: bool = field(default=False)
+    description_hidden_layer: int = field(default=-2)
+    description_max_tokens: int = field(default=32)
+    description_align_weight: float = field(default=1.0)
+    description_utility_weight: float = field(default=1.0)
+    standard_ce_weight: float = field(default=1.0)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -474,10 +485,6 @@ def preprocess_v1(
                 round_len = len(tokenizer(rou).input_ids)
                 instruction_len = len(tokenizer(parts[0]).input_ids) - 2
 
-            if i != 0 and not tokenizer.legacy and IS_TOKENIZER_GREATER_THAN_0_14:
-                round_len -= 1
-                instruction_len -= 1
-
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -500,7 +507,6 @@ def preprocess_v1(
 def preprocess_mpt(
     sources,
     tokenizer: transformers.PreTrainedTokenizer,
-    has_image: bool = False
 ) -> Dict:
     conv = conversation_lib.default_conversation.copy()
     roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -520,18 +526,7 @@ def preprocess_mpt(
         conversations.append(conv.get_prompt())
 
     # Tokenize conversations
-
-    if has_image:
-        input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
-    else:
-        input_ids = tokenizer(
-            conversations,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        ).input_ids
-
+    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
     targets = input_ids.clone()
     assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
 
@@ -554,18 +549,8 @@ def preprocess_mpt(
             if len(parts) != 2:
                 break
             parts[0] += sep
-
-            if has_image:
-                round_len = len(tokenizer_image_token(rou, tokenizer))
-                instruction_len = len(tokenizer_image_token(parts[0], tokenizer)) - 1
-            else:
-                round_len = len(tokenizer(rou).input_ids)
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 1
-
-            if i != 0 and getattr(tokenizer, 'legacy', False) and IS_TOKENIZER_GREATER_THAN_0_14:
-                round_len += 1
-                instruction_len += 1
-
+            round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
+            instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
             target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
 
             cur_len += round_len
@@ -626,7 +611,7 @@ def preprocess(
     if conversation_lib.default_conversation.version.startswith("v1"):
         return preprocess_v1(sources, tokenizer, has_image=has_image)
     if conversation_lib.default_conversation.version == "mpt":
-        return preprocess_mpt(sources, tokenizer, has_image=has_image)
+        return preprocess_mpt(sources, tokenizer)
     # add end signal and concatenate together
     conversations = []
     for source in sources:
@@ -655,6 +640,64 @@ def preprocess(
     return dict(input_ids=input_ids, labels=targets)
 
 
+def build_single_turn_prompt(message: str) -> str:
+    conv = conversation_lib.default_conversation.copy()
+    conv.messages = []
+    conv.append_message(conv.roles[0], message)
+    conv.append_message(conv.roles[1], None)
+    return conv.get_prompt()
+
+
+def build_multimodal_instruction_text(
+    text: str,
+    data_args: DataArguments,
+    image_count: int = 1,
+) -> str:
+    image_prefix = "\n".join([DEFAULT_IMAGE_TOKEN] * max(1, image_count))
+    source = [[{"from": "human", "value": f"{image_prefix}\n{text}".strip()}]]
+    source = preprocess_multimodal(source, data_args)
+    return source[0][0]["value"]
+
+
+def build_cache_key(prefix: str, index: int) -> str:
+    return f"{prefix}_{index:08d}"
+
+
+def get_description_cache_path(cache_dir: str, cache_key: str) -> str:
+    return os.path.join(cache_dir, f"{cache_key}.pt")
+
+
+def select_description_tokens(hidden_states: torch.Tensor,
+                              attention_mask: torch.Tensor,
+                              max_tokens: int) -> List[torch.Tensor]:
+    lengths = attention_mask.long().sum(dim=1).tolist()
+    sequences = []
+    for batch_idx, cur_len in enumerate(lengths):
+        start_idx = max(0, cur_len - max_tokens)
+        sequences.append(hidden_states[batch_idx, start_idx:cur_len].detach())
+    return sequences
+
+
+def pad_description_sequences(sequences: Sequence[torch.Tensor],
+                              padding_value: float = 0.0) -> Dict[str, torch.Tensor]:
+    if len(sequences) == 0:
+        raise ValueError("`sequences` must be non-empty.")
+    max_len = max(seq.shape[0] for seq in sequences)
+    hidden_size = sequences[0].shape[-1]
+    device = sequences[0].device
+    dtype = sequences[0].dtype
+    padded = torch.full((len(sequences), max_len, hidden_size), padding_value, dtype=dtype, device=device)
+    mask = torch.zeros((len(sequences), max_len), dtype=torch.bool, device=device)
+    for idx, seq in enumerate(sequences):
+        seq_len = seq.shape[0]
+        padded[idx, :seq_len] = seq
+        mask[idx, :seq_len] = True
+    return {
+        "states": padded,
+        "mask": mask,
+    }
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -663,6 +706,18 @@ class LazySupervisedDataset(Dataset):
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
         list_data_dict = json.load(open(data_path, "r"))
+        for idx, sample in enumerate(list_data_dict):
+            sample["_description_cache_key"] = build_cache_key("train", idx)
+
+        if data_args.memory_data_path is not None:
+            rank0_print("Adding memory data... {}".format(data_args.memory_data_path))
+            list_memory_data_dict = json.load(open(data_args.memory_data_path, "r"))
+            for idx, sample in enumerate(list_memory_data_dict):
+                sample["_description_cache_key"] = build_cache_key("memory", idx)
+
+            list_data_dict = list_data_dict + list_memory_data_dict
+            
+            random.shuffle(list_data_dict)
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -688,6 +743,15 @@ class LazySupervisedDataset(Dataset):
             cur_len = cur_len if 'image' in sample else -cur_len
             length_list.append(cur_len)
         return length_list
+    
+    @property
+    def modality_lengths_for_SAT(self):
+        length_list = []
+        for sample in self.list_data_dict:
+            cur_len = sum(len(conv['value'].split()) for conv in sample['conversations'])
+            cur_len = cur_len if isinstance(sample['image'], list) else -cur_len
+            length_list.append(cur_len)
+        return length_list
 
     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
         sources = self.list_data_dict[i]
@@ -698,7 +762,14 @@ class LazySupervisedDataset(Dataset):
             image_file = self.list_data_dict[i]['image']
             image_folder = self.data_args.image_folder
             processor = self.data_args.image_processor
-            image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+            image_count = len(image_file) if isinstance(image_file, list) else 1
+            
+            if isinstance(image_file, list):
+                image = []
+                for img_file in image_file:
+                    image.append(Image.open(os.path.join(image_folder, img_file)).convert('RGB'))
+            else:
+                image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
             if self.data_args.image_aspect_ratio == 'pad':
                 def expand2square(pil_img, background_color):
                     width, height = pil_img.size
@@ -712,10 +783,22 @@ class LazySupervisedDataset(Dataset):
                         result = Image.new(pil_img.mode, (height, height), background_color)
                         result.paste(pil_img, ((height - width) // 2, 0))
                         return result
-                image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                if isinstance(image, list):
+                    image = [expand2square(img, tuple(int(x*255) for x in processor.image_mean)) for img in image]
+                    image = [processor.preprocess(img, return_tensors='pt')['pixel_values'][0] for img in image]
+                else:
+                    image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                    try:
+                        image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                    except Exception as e:
+                        print('Wrong image', image_folder, image_file)
+                        print(e)
+                        raise e
             else:
-                image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                if isinstance(image, list):
+                    image = [processor.preprocess(img, return_tensors='pt')['pixel_values'][0] for img in image]
+                else:
+                    image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
             sources = preprocess_multimodal(
                 copy.deepcopy([e["conversations"] for e in sources]),
                 self.data_args)
@@ -732,6 +815,25 @@ class LazySupervisedDataset(Dataset):
         # image exist in the data
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
+            description_text = build_multimodal_instruction_text(
+                self.data_args.description_prompt,
+                self.data_args,
+                image_count=image_count,
+            )
+            description_prompt = build_single_turn_prompt(description_text)
+            data_dict["description_input_ids"] = tokenizer_image_token(
+                description_prompt,
+                self.tokenizer,
+                return_tensors='pt',
+            )
+            data_dict["description_cache_key"] = self.list_data_dict[i]["_description_cache_key"]
+            if self.data_args.description_cache_dir is not None:
+                cache_path = get_description_cache_path(
+                    self.data_args.description_cache_dir,
+                    data_dict["description_cache_key"],
+                )
+                if os.path.exists(cache_path):
+                    data_dict["reference_description_states"] = torch.load(cache_path, map_location="cpu")
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
@@ -745,9 +847,34 @@ class DataCollatorForSupervisedDataset(object):
 
     tokenizer: transformers.PreTrainedTokenizer
 
+    def _truncate_preserving_targets(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        max_length = self.tokenizer.model_max_length
+        if input_ids.shape[0] <= max_length:
+            return input_ids, labels
+
+        target_positions = torch.nonzero(labels.ne(IGNORE_INDEX), as_tuple=False).flatten()
+        if target_positions.numel() == 0 or target_positions[-1].item() < max_length:
+            return input_ids[:max_length], labels[:max_length]
+
+        # Preserve the multimodal/prompt prefix while keeping the target tokens at the end.
+        prefix_len = min(64, max_length - target_positions.numel())
+        suffix_len = max_length - prefix_len
+        input_ids = torch.cat((input_ids[:prefix_len], input_ids[-suffix_len:]), dim=0)
+        labels = torch.cat((labels[:prefix_len], labels[-suffix_len:]), dim=0)
+        return input_ids, labels
+
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
+        truncated = [
+            self._truncate_preserving_targets(cur_input_ids, cur_labels)
+            for cur_input_ids, cur_labels in zip(input_ids, labels)
+        ]
+        input_ids, labels = zip(*truncated)
         input_ids = torch.nn.utils.rnn.pad_sequence(
             input_ids,
             batch_first=True,
@@ -755,8 +882,6 @@ class DataCollatorForSupervisedDataset(object):
         labels = torch.nn.utils.rnn.pad_sequence(labels,
                                                  batch_first=True,
                                                  padding_value=IGNORE_INDEX)
-        input_ids = input_ids[:, :self.tokenizer.model_max_length]
-        labels = labels[:, :self.tokenizer.model_max_length]
         batch = dict(
             input_ids=input_ids,
             labels=labels,
@@ -765,10 +890,32 @@ class DataCollatorForSupervisedDataset(object):
 
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
-            else:
+            if isinstance(images[0], list):
+                images = torch.stack([torch.stack(img, dim=0) for img in images], dim = 0)
                 batch['images'] = images
+            else:
+                if all(x is not None and x.shape == images[0].shape for x in images):
+                    batch['images'] = torch.stack(images)
+                else:
+                    batch['images'] = images
+
+        if 'description_input_ids' in instances[0]:
+            description_input_ids = [instance["description_input_ids"] for instance in instances]
+            description_input_ids = torch.nn.utils.rnn.pad_sequence(
+                description_input_ids,
+                batch_first=True,
+                padding_value=self.tokenizer.pad_token_id,
+            )
+            description_input_ids = description_input_ids[:, :self.tokenizer.model_max_length]
+            batch["description_input_ids"] = description_input_ids
+            batch["description_attention_mask"] = description_input_ids.ne(self.tokenizer.pad_token_id)
+            batch["description_cache_keys"] = [instance["description_cache_key"] for instance in instances]
+
+        if 'reference_description_states' in instances[0]:
+            reference_states = [instance["reference_description_states"] for instance in instances]
+            padded_reference = pad_description_sequences(reference_states)
+            batch["reference_description_states"] = padded_reference["states"]
+            batch["reference_description_mask"] = padded_reference["mask"]
 
         return batch
 
@@ -784,16 +931,180 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator)
 
+def load_model_from_previous_task(model, previous_task_model_path):
+    token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
+    # if model.lm_head.weight.shape[0] != token_num:
+    #     model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
+    #     model.model.embed_tokens.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
 
-def train(attn_implementation=None):
+    print('Loading additional LLaVA weights...')
+    if os.path.exists(os.path.join(previous_task_model_path, 'non_lora_trainables.bin')):
+        non_lora_trainables = torch.load(os.path.join(previous_task_model_path, 'non_lora_trainables.bin'), map_location='cpu')
+    else:
+        # this is probably from HF Hub
+        from huggingface_hub import hf_hub_download
+        def load_from_hf(repo_id, filename, subfolder=None):
+            cache_file = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                subfolder=subfolder)
+            return torch.load(cache_file, map_location='cpu')
+        non_lora_trainables = load_from_hf(previous_task_model_path, 'non_lora_trainables.bin')
+    non_lora_trainables = {(k[11:] if k.startswith('base_model.') else k): v for k, v in non_lora_trainables.items()}
+    if any(k.startswith('model.model.') for k in non_lora_trainables):
+        non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
+    model.base_model.model.load_state_dict(non_lora_trainables, strict=False)
+
+    from peft import PeftModel
+    print('Loading LoRA weights...')
+    filename = os.path.join(previous_task_model_path, WEIGHTS_NAME)
+    adapters_weights = torch.load(filename, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+    load_result = set_peft_model_state_dict(model, adapters_weights, adapter_name="default")
+    print('Model is loaded...')
+
+
+def move_batch_to_device(batch, device):
+    moved_batch = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor):
+            moved_batch[key] = value.to(device)
+        elif isinstance(value, list):
+            moved_batch[key] = [item.to(device) if isinstance(item, torch.Tensor) else item for item in value]
+        else:
+            moved_batch[key] = value
+    return moved_batch
+
+
+def move_images_to_vision_tower(batch, model):
+    images = batch.get("images")
+    if images is None:
+        return batch
+
+    vision_tower = model.get_vision_tower()
+    target_device = vision_tower.device
+    target_dtype = vision_tower.dtype
+
+    if isinstance(images, torch.Tensor):
+        batch["images"] = images.to(device=target_device, dtype=target_dtype)
+    elif isinstance(images, list):
+        batch["images"] = [
+            image.to(device=target_device, dtype=target_dtype) if isinstance(image, torch.Tensor) else image
+            for image in images
+        ]
+    return batch
+
+
+def extract_description_cache(model, tokenizer, data_args, training_args):
+    if data_args.description_cache_dir is None:
+        raise ValueError("`description_cache_dir` is required when extracting description cache.")
+
+    os.makedirs(data_args.description_cache_dir, exist_ok=True)
+    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    train_dataset = data_module["train_dataset"]
+    data_collator = data_module["data_collator"]
+
+    model.eval()
+    cache_manifest = {
+        "data_path": data_args.data_path,
+        "memory_data_path": data_args.memory_data_path,
+        "description_prompt": data_args.description_prompt,
+        "description_hidden_layer": training_args.description_hidden_layer,
+        "description_max_tokens": training_args.description_max_tokens,
+        "num_samples": len(train_dataset),
+    }
+    cached_count = 0
+
+    def build_autocast_context():
+        if training_args.fp16:
+            return torch.autocast(device_type="cuda", dtype=torch.float16)
+        if training_args.bf16:
+            return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        return nullcontext()
+
+    for idx in range(len(train_dataset)):
+        sample = train_dataset[idx]
+        if "description_input_ids" not in sample:
+            continue
+        cache_path = get_description_cache_path(
+            data_args.description_cache_dir,
+            sample["description_cache_key"],
+        )
+        batch = data_collator([sample])
+        batch = move_batch_to_device(batch, training_args.device)
+        batch = move_images_to_vision_tower(batch, model)
+        with torch.no_grad(), build_autocast_context():
+            outputs = model(
+                input_ids=batch["description_input_ids"],
+                attention_mask=batch["description_attention_mask"],
+                images=batch.get("images"),
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+            hidden_states = outputs.hidden_states[training_args.description_hidden_layer]
+            description_sequences = select_description_tokens(
+                hidden_states,
+                batch["description_attention_mask"],
+                training_args.description_max_tokens,
+            )
+        torch.save(description_sequences[0].cpu(), cache_path)
+        cached_count += 1
+
+        if idx % 100 == 0:
+            rank0_print(f"Cached description states: {idx + 1}/{len(train_dataset)}")
+
+    cache_manifest["cached_entries"] = cached_count
+    with open(os.path.join(data_args.description_cache_dir, "meta.json"), "w") as f:
+        json.dump(cache_manifest, f, indent=2)
+
+    if cached_count == 0:
+        raise ValueError("Description cache extraction produced 0 entries.")
+
+
+def maybe_sync_description_cache_settings(data_args, training_args):
+    if not training_args.enable_description_cl or data_args.description_cache_dir is None:
+        return
+
+    meta_path = os.path.join(data_args.description_cache_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        return
+
+    with open(meta_path, "r") as f:
+        cache_meta = json.load(f)
+
+    cached_max_tokens = cache_meta.get("description_max_tokens")
+    if cached_max_tokens is not None and cached_max_tokens != training_args.description_max_tokens:
+        rank0_print(
+            f"Overriding description_max_tokens from {training_args.description_max_tokens} "
+            f"to cached value {cached_max_tokens} based on {meta_path}."
+        )
+        training_args.description_max_tokens = cached_max_tokens
+
+    cached_hidden_layer = cache_meta.get("description_hidden_layer")
+    if cached_hidden_layer is not None and cached_hidden_layer != training_args.description_hidden_layer:
+        rank0_print(
+            f"Overriding description_hidden_layer from {training_args.description_hidden_layer} "
+            f"to cached value {cached_hidden_layer} based on {meta_path}."
+        )
+        training_args.description_hidden_layer = cached_hidden_layer
+
+def train():
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.enable_description_cl and training_args.gradient_checkpointing:
+        rank0_print(
+            "Disabling gradient checkpointing because description continual-learning "
+            "uses multiple gradient-carrying forwards per step, which is incompatible "
+            "with DeepSpeed ZeRO-2 gradient reduction."
+        )
+        training_args.gradient_checkpointing = False
+
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
-
+    
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
         from transformers import BitsAndBytesConfig
@@ -817,7 +1128,7 @@ def train(attn_implementation=None):
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
-            model = LlavaMptForCausalLM.from_pretrained(
+            model = LlavaMPTForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
                 cache_dir=training_args.cache_dir,
@@ -827,16 +1138,12 @@ def train(attn_implementation=None):
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 cache_dir=training_args.cache_dir,
-                attn_implementation=attn_implementation,
-                torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
-                **bnb_model_from_pretrained_args
+                **bnb_model_from_pretrained_args,
             )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
-            attn_implementation=attn_implementation,
-            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
     model.config.use_cache = False
@@ -867,11 +1174,8 @@ def train(attn_implementation=None):
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
+        if training_args.bits == 16 and training_args.bf16:
+            model.to(torch.bfloat16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 
@@ -888,7 +1192,7 @@ def train(attn_implementation=None):
             cache_dir=training_args.cache_dir,
             model_max_length=training_args.model_max_length,
             padding_side="right",
-            use_fast=False,
+            use_fast=True,
         )
 
     if model_args.version == "v0":
@@ -956,6 +1260,20 @@ def train(attn_implementation=None):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    if model_args.previous_task_model_path is not None:
+        # load model from previous task
+        load_model_from_previous_task(model, model_args.previous_task_model_path)
+
+    if training_args.extract_description_cache_only:
+        if model_args.previous_task_model_path is None:
+            raise ValueError("`extract_description_cache_only=True` requires `previous_task_model_path`.")
+        extract_description_cache(model, tokenizer, data_args, training_args)
+        return
+
+    if training_args.enable_description_cl and data_args.description_cache_dir is None:
+        raise ValueError("`enable_description_cl=True` requires `description_cache_dir`.")
+    maybe_sync_description_cache_settings(data_args, training_args)
+
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
     trainer = LLaVATrainer(model=model,
@@ -963,10 +1281,10 @@ def train(attn_implementation=None):
                     args=training_args,
                     **data_module)
 
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
+    # if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+    #     trainer.train(resume_from_checkpoint=True)
+    # else:
+    trainer.train()
     trainer.save_state()
 
     model.config.use_cache = True
@@ -986,6 +1304,8 @@ def train(attn_implementation=None):
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
 
+    remove_dir = training_args.output_dir
+    subprocess.run(f"find {remove_dir} -maxdepth 1 -type d -name 'checkpoint-*' -exec rm -rf {{}} +", shell=True)
 
 if __name__ == "__main__":
     train()

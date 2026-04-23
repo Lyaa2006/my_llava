@@ -164,10 +164,10 @@ We also provide an `environment.yml` file to help users identify missing depende
 
 Before running, please set all the model paths to your local paths. The paths that need to be modified are listed below, and don’t forget to update the dataset path as well.
 
-- Change `/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2` to `/your_path/MCITlib`.
-- Change `/mnt/haiyangguo/mywork/FCIT/pre_trained/llava-v1.5-7b` to `/your_path/llava-v1.5-7b`.
+- Change `/mnt/lyaa/MCITlib` to `/your_path/MCITlib`.
+- Change `/mnt/lyaa/MCITlib/llava-v1.5-7b` to `/your_path/llava-v1.5-7b`.
 - Change `/mnt/haiyangguo/mywork/CL-MLLM/pre_trained/Internvl-chat-7b` to `/your_path/Internvl-chat-7b`.
-- Change `/mnt/ShareDB_6TB/models/clip-vit-large-patch14-336` to `/your_path/clip-vit-large-patch14-336`.
+- Change `/mnt/lyaa/MCITlib/clip-vit-large-patch14-336` to `/your_path/clip-vit-large-patch14-336`.
 - Change `/mnt/ShareDB_6TB/models/InternViT-6B-224px` to `/your_path/InternViT-6B-224px`.
 - Change `/mnt/ShareDB_6TB/datasets/MLLM_CL/checkpoint` to `/your_path/checkpoint`.
 

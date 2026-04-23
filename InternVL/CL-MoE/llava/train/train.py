@@ -14,7 +14,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/CL-MoE')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/CL-MoE')
 import os
 import copy
 from dataclasses import dataclass, field
@@ -792,7 +792,7 @@ def train(attn_implementation=None):
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    with open("/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/CL-MoE/task.txt", "w") as t:
+    with open("/mnt/lyaa/MCITlib/InternVL/CL-MoE/task.txt", "w") as t:
         t.write(model_args.task)
 
     local_rank = training_args.local_rank

@@ -3,16 +3,17 @@ import json
 import os
 
 import openai
+from openai import OpenAI
 import time
 
 NUM_SECONDS_TO_SLEEP = 0.5
 
 
-def get_eval(content: str, max_tokens: int):
+def get_eval(content: str, max_tokens: int, client):
     while True:
         try:
-            response = openai.ChatCompletion.create(
-                model='gpt-4-0314',
+            response = client.chat.completions.create(
+                model='gpt-3.5-turbo',
                 messages=[{
                     'role': 'system',
                     'content': 'You are a helpful and precise assistant for checking the quality of the answer.'
@@ -58,6 +59,8 @@ if __name__ == '__main__':
     parser.add_argument('-o', '--output')
     parser.add_argument('--max-tokens', type=int, default=1024, help='maximum number of tokens produced in the output')
     args = parser.parse_args()
+
+    client = OpenAI(api_key="sk-xxx", base_url="https://orisound.cn/v1")
 
     f_q = open(os.path.expanduser(args.question))
     f_ans1 = open(os.path.expanduser(args.answer_list[0]))
@@ -105,7 +108,7 @@ if __name__ == '__main__':
             'category': category
         }
         if idx >= len(cur_reviews):
-            review = get_eval(content, args.max_tokens)
+            review = get_eval(content, args.max_tokens, client)
             scores = parse_score(review)
             cur_js['content'] = review
             cur_js['tuple'] = scores

@@ -22,7 +22,7 @@ import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/HiDe')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/HiDe')
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", num_task=10, text_tower=None, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}

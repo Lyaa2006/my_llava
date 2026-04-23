@@ -3,7 +3,7 @@ import torch
 import os
 import json
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/ModalPrompt')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/ModalPrompt')
 from tqdm import tqdm
 import shortuuid
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig

@@ -1,6 +1,6 @@
 # #!/bin/bash
 
-HARD_PATH=/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2
+HARD_PATH=/mnt/lyaa/MCITlib
 
 # pip install -e .
 # bash scripts/MCITlib/Eval_MLLM_ACL/eval_OCR.sh $HARD_PATH/configs/modal_configs/internvl.json $HARD_PATH/configs/data_configs/MLLM-ACL/OCR.json $HARD_PATH/configs/train_configs/LoRA-FT/InternVL/MLLM-ACL/eval/zero_shot.json

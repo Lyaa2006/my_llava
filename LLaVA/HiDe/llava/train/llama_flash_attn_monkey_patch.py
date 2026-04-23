@@ -1,4 +1,5 @@
 from typing import Optional, Tuple
+import os
 import warnings
 
 import torch
@@ -103,13 +104,23 @@ def _prepare_decoder_attention_mask(
 
 
 def replace_llama_attn_with_flash_attn():
+    if os.environ.get("DISABLE_FLASH_ATTN", "0") == "1":
+        warnings.warn("Flash attention disabled by DISABLE_FLASH_ATTN=1.")
+        return False
+
+    if not torch.cuda.is_available():
+        warnings.warn("CUDA is not available, skip enabling flash attention.")
+        return False
+
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
     if cuda_major < 8:
         warnings.warn(
             "Flash attention is only supported on A100 or H100 GPU during training due to head dim > 64 backward."
             "ref: https://github.com/HazyResearch/flash-attention/issues/190#issuecomment-1523359593"
         )
+        return False
     transformers.models.llama.modeling_llama.LlamaModel._prepare_decoder_attention_mask = (
         _prepare_decoder_attention_mask
     )
     transformers.models.llama.modeling_llama.LlamaAttention.forward = forward
+    return True

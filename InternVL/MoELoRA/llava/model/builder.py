@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/MoELoRA')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/MoELoRA')
 import os
 import warnings
 import shutil

@@ -4,10 +4,8 @@
 
 # Need to call this before importing transformers.
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/LoRA-FT')
-from llava.train.llama_flash_attn_monkey_patch import replace_llama_attn_with_flash_attn
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/LoRA-FT')
 
-replace_llama_attn_with_flash_attn()
 
 from llava.train.train import train
 

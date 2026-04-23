@@ -47,7 +47,10 @@ class LlavaMetaModel:
 
         self.config.mm_vision_tower = vision_tower
 
-        if self.get_vision_tower() is None:
+        current_vision_tower = self.get_vision_tower()
+        current_vision_tower_name = getattr(current_vision_tower, "vision_tower_name", None)
+
+        if current_vision_tower is None or current_vision_tower_name != vision_tower:
             vision_tower = build_vision_tower(model_args)
 
             if fsdp is not None and len(fsdp) > 0:
@@ -282,4 +285,3 @@ class LlavaMetaForCausalLM(ABC):
                     p.requires_grad = False
                 for p in self.get_output_embeddings().parameters():
                     p.requires_grad = False
-

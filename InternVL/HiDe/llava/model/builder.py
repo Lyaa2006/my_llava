@@ -13,7 +13,7 @@
 #    limitations under the License.
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/HiDe')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/HiDe')
 import os
 import warnings
 import shutil

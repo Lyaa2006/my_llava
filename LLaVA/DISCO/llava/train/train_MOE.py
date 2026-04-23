@@ -24,7 +24,7 @@ from typing import Dict, Optional, Sequence, List
 
 import torch
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/DISCO')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/DISCO')
 import transformers
 import subprocess
 

@@ -24,7 +24,7 @@ from typing import Dict, Optional, Sequence, List
 
 import torch
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/CL-MoE')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/CL-MoE')
 import transformers
 import subprocess
 
@@ -810,7 +810,7 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    with open("/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/CL-MoE/task.txt", "w") as t:
+    with open("/mnt/lyaa/MCITlib/LLaVA/CL-MoE/task.txt", "w") as t:
         t.write(model_args.task)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))

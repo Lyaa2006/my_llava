@@ -68,7 +68,7 @@ class CLIPVisionTower(nn.Module):
             self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name)
         self.vision_tower.requires_grad_(False)
 
-        clip_vision_tower_name = '/mnt/ShareDB_6TB/models/clip-vit-large-patch14-336'
+        clip_vision_tower_name = '/mnt/lyaa/MCITlib/clip-vit-large-patch14-336'
         self.clip_vision_tower = CLIPVisionModelWithProjection.from_pretrained(clip_vision_tower_name)
         self.clip_vision_tower.requires_grad_(False)
 

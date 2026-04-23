@@ -14,7 +14,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/SEFE')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/SEFE')
 import os
 import copy
 from dataclasses import dataclass, field

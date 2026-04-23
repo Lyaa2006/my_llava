@@ -24,7 +24,7 @@ import pathlib, random
 from typing import Dict, Optional, Sequence, List
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/ModalPrompt')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/ModalPrompt')
 
 import torch
 

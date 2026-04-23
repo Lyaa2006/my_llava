@@ -15,7 +15,7 @@
 #    limitations under the License.
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/ModalPrompt')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/ModalPrompt')
 import os
 import copy
 from dataclasses import dataclass, field

@@ -12,7 +12,7 @@ import transformers
 import subprocess
 import tokenizers
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/SEFE')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/SEFE')
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from torch.utils.data import Dataset

@@ -24,7 +24,7 @@ from typing import Dict, Optional, Sequence, List
 
 import torch
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/HiDe')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/HiDe')
 import transformers
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN

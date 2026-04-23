@@ -15,7 +15,7 @@
 #    limitations under the License.
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/DISCO')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/DISCO')
 import os
 import copy
 from dataclasses import dataclass, field

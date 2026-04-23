@@ -26,7 +26,7 @@ import torch
 import sys
 import transformers
 import subprocess
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/LoRA-FT')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/LoRA-FT')
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from peft.utils import WEIGHTS_NAME, set_peft_model_state_dict
@@ -909,11 +909,8 @@ def train():
             bias=training_args.lora_bias,
             task_type="CAUSAL_LM",
         )
-        if training_args.bits == 16:
-            if training_args.bf16:
-                model.to(torch.bfloat16)
-            if training_args.fp16:
-                model.to(torch.float16)
+        if training_args.bits == 16 and training_args.bf16:
+            model.to(torch.bfloat16)
         rank0_print("Adding LoRA adapters...")
         model = get_peft_model(model, lora_config)
 

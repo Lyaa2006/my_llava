@@ -1,6 +1,6 @@
 import os
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
 from torch.utils.data import Sampler
 
@@ -10,9 +10,12 @@ from transformers.trainer import (
     get_parameter_names,
     has_length,
     ALL_LAYERNORM_LAYERS,
+    ShardedDDPOption,
     logger,
 )
 from typing import List, Optional
+
+from llava.constants import IGNORE_INDEX
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -138,6 +141,8 @@ class LLaVATrainer(Trainer):
 
         if self.args.group_by_modality_length:
             lengths = self.train_dataset.modality_lengths
+            if self.args.is_SAT:
+                lengths = self.train_dataset.modality_lengths_for_SAT
             return LengthGroupedSampler(
                 self.args.train_batch_size,
                 world_size=self.args.world_size * self.args.gradient_accumulation_steps,
@@ -155,6 +160,8 @@ class LLaVATrainer(Trainer):
         Trainer's init through `optimizers`, or subclass and override this method in a subclass.
         """
         if is_sagemaker_mp_enabled():
+            return super().create_optimizer()
+        if self.sharded_ddp == ShardedDDPOption.SIMPLE:
             return super().create_optimizer()
 
         opt_model = self.model
@@ -210,20 +217,27 @@ class LLaVATrainer(Trainer):
 
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
-            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
-            if optimizer_cls.__name__ == "Adam8bit":
-                import bitsandbytes
+            if self.sharded_ddp == ShardedDDPOption.SIMPLE:
+                self.optimizer = OSS(
+                    params=optimizer_grouped_parameters,
+                    optim=optimizer_cls,
+                    **optimizer_kwargs,
+                )
+            else:
+                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+                if optimizer_cls.__name__ == "Adam8bit":
+                    import bitsandbytes
 
-                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                    manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
 
-                skipped = 0
-                for module in opt_model.modules():
-                    if isinstance(module, nn.Embedding):
-                        skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
-                        logger.info(f"skipped {module}: {skipped/2**20}M params")
-                        manager.register_module_override(module, "weight", {"optim_bits": 32})
-                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
-                logger.info(f"skipped: {skipped/2**20}M params")
+                    skipped = 0
+                    for module in opt_model.modules():
+                        if isinstance(module, nn.Embedding):
+                            skipped += sum({p.data_ptr(): p.numel() for p in module.parameters()}.values())
+                            logger.info(f"skipped {module}: {skipped/2**20}M params")
+                            manager.register_module_override(module, "weight", {"optim_bits": 32})
+                            logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+                    logger.info(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
 
@@ -247,6 +261,126 @@ class LLaVATrainer(Trainer):
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+
+    def _extract_description_states(self, model, inputs):
+        description_outputs = model(
+            input_ids=inputs["description_input_ids"],
+            attention_mask=inputs["description_attention_mask"],
+            images=inputs.get("images"),
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+        hidden_states = description_outputs.hidden_states[self.args.description_hidden_layer]
+        description_sequences = []
+        lengths = inputs["description_attention_mask"].long().sum(dim=1).tolist()
+        for batch_idx, cur_len in enumerate(lengths):
+            start_idx = max(0, cur_len - self.args.description_max_tokens)
+            description_sequences.append(hidden_states[batch_idx, start_idx:cur_len])
+        return description_sequences
+
+    def _pad_description_sequences(self, sequences, dtype=None):
+        max_len = max(seq.shape[0] for seq in sequences)
+        hidden_size = sequences[0].shape[-1]
+        device = sequences[0].device
+        if dtype is None:
+            dtype = sequences[0].dtype
+        padded = torch.zeros((len(sequences), max_len, hidden_size), dtype=dtype, device=device)
+        mask = torch.zeros((len(sequences), max_len), dtype=torch.bool, device=device)
+        for idx, seq in enumerate(sequences):
+            seq_len = seq.shape[0]
+            padded[idx, :seq_len] = seq.to(dtype=dtype)
+            mask[idx, :seq_len] = True
+        return padded, mask
+
+    def _masked_mean_pool(self, hidden_states, mask):
+        if hidden_states.shape[1] != mask.shape[1]:
+            shared_seq_len = min(hidden_states.shape[1], mask.shape[1])
+            padding_side = getattr(self.model.config, "tokenizer_padding_side", "right")
+            if padding_side == "left":
+                hidden_states = hidden_states[:, -shared_seq_len:]
+                mask = mask[:, -shared_seq_len:]
+            else:
+                hidden_states = hidden_states[:, :shared_seq_len]
+                mask = mask[:, :shared_seq_len]
+        mask = mask.unsqueeze(-1).to(dtype=hidden_states.dtype)
+        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+    def _compute_description_utility_loss(self, standard_outputs, inputs, description_states):
+        current_description_states, current_description_mask = self._pad_description_sequences(description_states)
+        description_summary = self._masked_mean_pool(current_description_states.float(), current_description_mask)
+
+        answer_hidden_states = standard_outputs.hidden_states[self.args.description_hidden_layer]
+        prepared_labels = getattr(standard_outputs, "prepared_labels", None)
+        prepared_attention_mask = getattr(standard_outputs, "prepared_attention_mask", None)
+        if prepared_labels is not None:
+            answer_mask = prepared_labels.ne(IGNORE_INDEX)
+        else:
+            answer_mask = inputs["labels"].ne(IGNORE_INDEX)
+        if not torch.any(answer_mask):
+            if prepared_attention_mask is not None:
+                answer_mask = prepared_attention_mask.bool()
+            else:
+                answer_mask = inputs["attention_mask"].bool()
+        answer_summary = self._masked_mean_pool(answer_hidden_states.float(), answer_mask)
+
+        return (1.0 - F.cosine_similarity(answer_summary, description_summary, dim=-1)).mean()
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        if not getattr(self.args, "enable_description_cl", False) or "description_input_ids" not in inputs:
+            return super().compute_loss(model, inputs, return_outputs=return_outputs)
+
+        standard_outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            labels=inputs["labels"],
+            images=inputs.get("images"),
+            return_dict=True,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        standard_loss = standard_outputs.loss
+
+        if "reference_description_states" not in inputs or "reference_description_mask" not in inputs:
+            raise ValueError("Description continual-learning loss requires offline cached reference description states.")
+
+        description_states = self._extract_description_states(model, inputs)
+        description_utility_loss = self._compute_description_utility_loss(standard_outputs, inputs, description_states)
+
+        current_description_states, current_description_mask = self._pad_description_sequences(
+            description_states,
+            dtype=inputs["reference_description_states"].dtype,
+        )
+        reference_description_states = inputs["reference_description_states"].to(current_description_states.device)
+        reference_description_mask = inputs["reference_description_mask"].to(current_description_states.device)
+        shared_seq_len = min(current_description_states.shape[1], reference_description_states.shape[1])
+        current_description_states = current_description_states[:, :shared_seq_len]
+        current_description_mask = current_description_mask[:, :shared_seq_len]
+        reference_description_states = reference_description_states[:, :shared_seq_len]
+        reference_description_mask = reference_description_mask[:, :shared_seq_len]
+        valid_mask = current_description_mask & reference_description_mask
+
+        diff = (current_description_states.float() - reference_description_states.float()) ** 2
+        valid_mask = valid_mask.unsqueeze(-1).float()
+        description_align_loss = (diff * valid_mask).sum() / (
+            valid_mask.sum().clamp_min(1.0) * current_description_states.shape[-1]
+        )
+
+        total_loss = (
+            self.args.description_align_weight * description_align_loss
+            + self.args.description_utility_weight * description_utility_loss
+            + self.args.standard_ce_weight * standard_loss
+        )
+
+        if return_outputs:
+            outputs = {
+                "standard_outputs": standard_outputs,
+                "standard_loss": standard_loss.detach(),
+                "description_utility_loss": description_utility_loss.detach(),
+                "description_align_loss": description_align_loss.detach(),
+            }
+            return total_loss, outputs
+        return total_loss
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

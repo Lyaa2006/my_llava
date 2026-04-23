@@ -1,5 +1,5 @@
 {
-  "model_name": "/mnt/haiyangguo/mywork/FCIT/pre_trained/llava-v1.5-7b",
-  "mm_projector": "/mnt/haiyangguo/mywork/FCIT/pre_trained/llava-v1.5-7b/mm_projector.bin",
-  "vision_tower": "/mnt/ShareDB_6TB/models/clip-vit-large-patch14-336"
+  "model_name": "/mnt/lyaa/MCITlib/llava-v1.5-7b",
+  "mm_projector": "/mnt/lyaa/MCITlib/llava-v1.5-7b/mm_projector.bin",
+  "vision_tower": "/mnt/lyaa/MCITlib/clip-vit-large-patch14-336"
 }

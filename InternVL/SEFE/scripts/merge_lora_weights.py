@@ -1,5 +1,5 @@
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/SEFE')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/SEFE')
 import argparse
 from llava.model.builder import load_pretrained_model
 from llava.eval.CoIN.coin_utils import get_model_name_from_path

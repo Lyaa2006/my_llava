@@ -2,7 +2,7 @@ import argparse
 import torch
 import os
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/LLaVA/ModalPrompt')
+sys.path.append('/mnt/lyaa/MCITlib/LLaVA/ModalPrompt')
 import json
 from tqdm import tqdm
 import shortuuid

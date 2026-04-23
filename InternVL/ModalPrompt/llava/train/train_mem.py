@@ -8,7 +8,7 @@
 # replace_llama_attn_with_flash_attn()
 
 import sys
-sys.path.append('/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/ModalPrompt')
+sys.path.append('/mnt/lyaa/MCITlib/InternVL/ModalPrompt')
 from llava.train.train import train
 
 if __name__ == "__main__":

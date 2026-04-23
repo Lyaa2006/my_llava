@@ -1,7 +1,7 @@
 # #!/bin/bash
 
 TASK_ID=$1
-HARD_PATH=/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2
+HARD_PATH=/mnt/lyaa/MCITlib
 
 if [ "$TASK_ID" == "1" ]; then
     pip install -e .

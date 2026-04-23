@@ -13,6 +13,10 @@ read_config() {
     python3 -c "import json; print(json.load(open('$1'))['$2'])"
 }
 
+read_config_or_default() {
+    python3 -c "import json; data=json.load(open('$1')); print(data.get('$2', '$3'))"
+}
+
 GPU_NUM=$(read_config "$TRAIN_CONFIG" gpu_num)
 RANK=$(read_config "$TRAIN_CONFIG" rank)
 EXPERT=$(read_config "$TRAIN_CONFIG" expert_num)
@@ -27,6 +31,10 @@ EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)
 GRAD_ACC=$(read_config "$TRAIN_CONFIG" grad_acc)
 LR=$(read_config "$TRAIN_CONFIG" lr)
+MAX_STEPS=$(read_config_or_default "$TRAIN_CONFIG" max_steps -1)
+SAVE_STEPS=$(read_config_or_default "$TRAIN_CONFIG" save_steps 2)
+MODEL_MAX_LENGTH=$(read_config_or_default "$TRAIN_CONFIG" model_max_length 512)
+NUM_WORKERS=$(read_config_or_default "$TRAIN_CONFIG" dataloader_num_workers 0)
 
 GPU_LIST=""
 for i in $(seq 0 $((GPU_NUM-1))); do
@@ -60,20 +68,22 @@ deepspeed --include localhost:$GPU_LIST --master_port 9001 llava/train/train_mem
     --output_dir $OUTPUT_DIR \
     --cur_task $CUR_TASK \
     --num_train_epochs $EPOCH \
+    --max_steps $MAX_STEPS \
     --per_device_train_batch_size $BATCH_SIZE \
     --per_device_eval_batch_size 16 \
     --gradient_accumulation_steps $GRAD_ACC \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 50000 \
+    --save_steps $SAVE_STEPS \
+    --save_total_limit 1 \
     --learning_rate $LR \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
     --lr_scheduler_type "cosine" \
     --logging_steps 1 \
     --tf32 True \
-    --model_max_length 2048 \
+    --model_max_length $MODEL_MAX_LENGTH \
     --gradient_checkpointing True \
-    --dataloader_num_workers 4 \
+    --dataloader_num_workers $NUM_WORKERS \
     --lazy_preprocess True \
     --report_to none

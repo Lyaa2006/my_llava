@@ -396,7 +396,7 @@ class CLMoEMOELoraLinear(nn.Linear, CLMoEMOELoraLayer):
 
             router = torch.softmax(router, dim=-1)
 
-            with open("/mnt/haiyangguo/mywork/CL-MLLM/MCITlib_v2/InternVL/CL-MoE/task.txt", "r" , encoding="utf-8") as f:
+            with open("/mnt/lyaa/MCITlib/InternVL/CL-MoE/task.txt", "r" , encoding="utf-8") as f:
                 task = f.read()
 
             import datetime
