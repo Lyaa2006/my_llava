@@ -1,0 +1,10 @@
+{
+  "gpu_num": 4,
+  "rank": 32,
+  "previous_model": "/mnt/ShareDB_6TB/datasets/MLLM_CL/checkpoint/MLLM-ACL/LLaVA-1.5/MyMethod/Task3_llava_lora",
+  "output_dir": "/mnt/ShareDB_6TB/datasets/MLLM_CL/checkpoint/MLLM-ACL/LLaVA-1.5/MyMethod/Task4_llava_lora",
+  "epoch": 3,
+  "batch_size": 4,
+  "grad_acc": 2,
+  "lr": 2e-4
+}

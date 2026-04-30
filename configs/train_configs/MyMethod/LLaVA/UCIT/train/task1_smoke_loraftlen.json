@@ -1,0 +1,17 @@
+{
+  "gpu_num": 2,
+  "rank": 1,
+  "output_dir": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task1_llava_lora_smoke_loraftlen",
+  "epoch": 1,
+  "batch_size": 1,
+  "grad_acc": 1,
+  "lr": 2e-4,
+  "bits": 4,
+  "max_steps": 2,
+  "save_steps": 2,
+  "dataloader_num_workers": 0,
+  "model_max_length": 2048,
+  "bf16": false,
+  "fp16": true,
+  "tf32": false
+}

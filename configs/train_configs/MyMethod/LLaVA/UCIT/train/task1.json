@@ -1,0 +1,14 @@
+{
+  "gpu_num": 4,
+  "rank": 16,
+  "output_dir": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task1_llava_lora",
+  "epoch": 1,
+  "batch_size": 1,
+  "grad_acc": 32,
+  "lr": 2e-4,
+  "bits": 16,
+  "model_max_length": 1024,
+  "bf16": false,
+  "fp16": true,
+  "tf32": false
+}

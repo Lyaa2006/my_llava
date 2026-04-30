@@ -44,3 +44,8 @@ UCIT/*
 # Other
 .DS_Store
 results
+
+# Allow committing MyMethod train configs (these are JSON by design)
+!configs/train_configs/MyMethod/**/*.json
+!configs/train_configs/MyMethod/**/UCIT/
+!configs/train_configs/MyMethod/**/UCIT/**
