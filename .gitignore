@@ -48,4 +48,7 @@ results
 # Allow committing MyMethod train configs (these are JSON by design)
 !configs/train_configs/MyMethod/**/*.json
 !configs/train_configs/MyMethod/**/UCIT/
-!configs/train_configs/MyMethod/**/UCIT/**
+!configs/train_configs/MyMethod/**/UCIT/**/*.json
+
+# Keep macOS metadata files ignored even under unignored paths
+.DS_Store
