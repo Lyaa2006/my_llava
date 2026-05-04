@@ -1,8 +1,8 @@
 {
   "gpu_num": 4,
   "rank": 16,
-  "previous_model": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/LoRA/Task1_llava_lora",
-  "output_dir": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/LoRA/Task2_llava_lora",
+  "previous_model": "/mnt/lyaa/my_llava/checkpoints/UCIT/LLaVA-1.5/LoRA/Task1_llava_lora",
+  "output_dir": "/mnt/lyaa/my_llava/checkpoints/UCIT/LLaVA-1.5/LoRA/Task2_llava_lora",
   "epoch": 1,
   "batch_size": 16,
   "grad_acc": 2,

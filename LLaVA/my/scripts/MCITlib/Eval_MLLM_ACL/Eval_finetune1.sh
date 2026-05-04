@@ -1,7 +1,7 @@
 # #!/bin/bash
 
 TASK_ID=$1
-HARD_PATH=/mnt/lyaa/MCITlib
+HARD_PATH=/mnt/lyaa/my_llava
 CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/MLLM-ACL}
 
 if [ "$TASK_ID" == "1" ]; then

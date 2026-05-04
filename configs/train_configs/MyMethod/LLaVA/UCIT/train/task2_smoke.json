@@ -1,8 +1,8 @@
 {
   "gpu_num": 2,
   "rank": 1,
-  "previous_model": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task1_llava_lora_smoke",
-  "output_dir": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task2_llava_lora_smoke",
+  "previous_model": "/mnt/lyaa/my_llava/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task1_llava_lora_smoke",
+  "output_dir": "/mnt/lyaa/my_llava/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task2_llava_lora_smoke",
   "epoch": 1,
   "batch_size": 1,
   "grad_acc": 1,
@@ -11,7 +11,7 @@
   "max_steps": 1,
   "save_steps": 1,
   "dataloader_num_workers": 0,
-  "model_max_length": 192,
+  "model_max_length": 1024,
   "bf16": false,
   "fp16": true,
   "tf32": false

@@ -3,7 +3,7 @@ from .clip_encoder import CLIPVisionTower
 
 
 LOCAL_VISION_TOWER_MAP = {
-    "openai/clip-vit-large-patch14-336": "/mnt/lyaa/MCITlib/clip-vit-large-patch14-336",
+    "openai/clip-vit-large-patch14-336": "/mnt/lyaa/my_llava/clip-vit-large-patch14-336",
 }
 
 

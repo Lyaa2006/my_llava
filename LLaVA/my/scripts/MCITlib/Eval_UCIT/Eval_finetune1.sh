@@ -1,8 +1,15 @@
 # #!/bin/bash
 
 TASK_ID=$1
-HARD_PATH=/mnt/lyaa/MCITlib
-CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}
+
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "$SCRIPT_DIR/../../..")"
+MCITLIB_ROOT_DEFAULT="$(realpath "$PROJECT_ROOT/../..")"
+
+HARD_PATH="${HARD_PATH:-${MCITLIB_ROOT:-$MCITLIB_ROOT_DEFAULT}}"
+CONFIG_ROOT="${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}"
+
+cd "$PROJECT_ROOT"
 
 if [ "$TASK_ID" == "1" ]; then
     bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ImageNet-R.json $CONFIG_ROOT/eval/task1.json

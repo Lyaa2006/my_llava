@@ -29,6 +29,7 @@ import subprocess
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from peft.utils import WEIGHTS_NAME, set_peft_model_state_dict
+from peft import PeftModel
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -121,6 +122,8 @@ class TrainingArguments(transformers.TrainingArguments):
     description_align_weight: float = field(default=1.0)
     description_utility_weight: float = field(default=1.0)
     standard_ce_weight: float = field(default=1.0)
+    orth_lora_weight: float = field(default=0.0)
+    old_lora_scale: float = field(default=1.0)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -140,15 +143,15 @@ def maybe_zero_3(param, ignore_status=False, name=None):
 # Borrowed from peft.utils.get_peft_model_state_dict
 def get_peft_state_maybe_zero_3(named_params, bias):
     if bias == "none":
-        to_return = {k: t for k, t in named_params if "lora_" in k}
+        to_return = {k: t for k, t in named_params if "lora_" in k and ".frozen_old." not in k}
     elif bias == "all":
-        to_return = {k: t for k, t in named_params if "lora_" in k or "bias" in k}
+        to_return = {k: t for k, t in named_params if ("lora_" in k or "bias" in k) and ".frozen_old." not in k}
     elif bias == "lora_only":
         to_return = {}
         maybe_lora_bias = {}
         lora_bias_names = set()
         for k, t in named_params:
-            if "lora_" in k:
+            if "lora_" in k and ".frozen_old." not in k:
                 to_return[k] = t
                 bias_name = k.split("lora_")[0] + "bias"
                 lora_bias_names.add(bias_name)
@@ -168,6 +171,20 @@ def get_peft_state_non_lora_maybe_zero_3(named_params, require_grad_only=True):
     if require_grad_only:
         to_return = {k: t for k, t in to_return.items() if t.requires_grad}
     to_return = {k: maybe_zero_3(v, ignore_status=True).cpu() for k, v in to_return.items()}
+    return to_return
+
+
+def get_peft_state_for_adapter_maybe_zero_3(named_params, adapter_name: str, bias: str = "none"):
+    adapter_token = f".{adapter_name}."
+    if bias == "none":
+        to_return = {k: t for k, t in named_params if "lora_" in k and adapter_token in k}
+    elif bias == "all":
+        to_return = {k: t for k, t in named_params if ("lora_" in k and adapter_token in k) or "bias" in k}
+    elif bias == "lora_only":
+        to_return = {k: t for k, t in named_params if "lora_" in k and adapter_token in k}
+    else:
+        raise NotImplementedError
+    to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
     return to_return
 
 
@@ -931,7 +948,7 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator)
 
-def load_model_from_previous_task(model, previous_task_model_path):
+def load_model_from_previous_task(model, previous_task_model_path, load_lora_to_default=True):
     token_num, tokem_dim = model.lm_head.out_features, model.lm_head.in_features
     # if model.lm_head.weight.shape[0] != token_num:
     #     model.lm_head.weight = torch.nn.Parameter(torch.empty(token_num, tokem_dim, device=model.device, dtype=model.dtype))
@@ -955,12 +972,68 @@ def load_model_from_previous_task(model, previous_task_model_path):
         non_lora_trainables = {(k[6:] if k.startswith('model.') else k): v for k, v in non_lora_trainables.items()}
     model.base_model.model.load_state_dict(non_lora_trainables, strict=False)
 
-    from peft import PeftModel
-    print('Loading LoRA weights...')
+    if load_lora_to_default:
+        print('Loading LoRA weights...')
+        filename = os.path.join(previous_task_model_path, WEIGHTS_NAME)
+        adapters_weights = torch.load(filename, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        load_result = set_peft_model_state_dict(model, adapters_weights, adapter_name="default")
+    print('Model is loaded...')
+
+
+def _set_multi_lora_forward(model, old_lora_scale: float):
+    model.old_lora_scale = old_lora_scale
+    for module in model.modules():
+        if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+            continue
+
+        if getattr(module, "_multi_lora_forward_wrapped", False):
+            module.old_lora_scale = old_lora_scale
+            continue
+
+        if not hasattr(module, "weight"):
+            continue
+
+        original_forward = module.forward
+
+        def multi_lora_forward(self, x: torch.Tensor):
+            result = self._single_lora_forward(x)
+
+            if self.disable_adapters or "frozen_old" not in self.lora_A:
+                return result
+
+            previous_scale = getattr(self, "old_lora_scale", 1.0)
+            if previous_scale == 0 or self.r["frozen_old"] <= 0:
+                return result
+
+            x_cast = x.to(self.lora_A["frozen_old"].weight.dtype)
+            output = self.lora_B["frozen_old"](self.lora_A["frozen_old"](x_cast))
+            output = output * self.scaling["frozen_old"] * previous_scale
+            return result + output.to(result.dtype)
+
+        module._single_lora_forward = original_forward
+        module.forward = multi_lora_forward.__get__(module, module.__class__)
+        module._multi_lora_forward_wrapped = True
+        module.old_lora_scale = old_lora_scale
+
+
+def load_previous_lora_as_frozen_adapter(model, previous_task_model_path, old_lora_scale: float):
+    print("Registering frozen old-task LoRA adapter...")
+    default_config = copy.deepcopy(model.peft_config["default"])
+    model.add_adapter("frozen_old", default_config)
+
     filename = os.path.join(previous_task_model_path, WEIGHTS_NAME)
     adapters_weights = torch.load(filename, map_location=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    load_result = set_peft_model_state_dict(model, adapters_weights, adapter_name="default")
-    print('Model is loaded...')
+    set_peft_model_state_dict(model, adapters_weights, adapter_name="frozen_old")
+
+    for name, param in model.named_parameters():
+        if ".frozen_old." in name:
+            param.requires_grad = False
+        elif "lora_" in name and ".default." in name:
+            param.requires_grad = True
+
+    model.set_adapter("default")
+    _set_multi_lora_forward(model, old_lora_scale)
+    model.previous_adapter_name = "frozen_old"
 
 
 def move_batch_to_device(batch, device):
@@ -1262,7 +1335,19 @@ def train():
 
     if model_args.previous_task_model_path is not None:
         # load model from previous task
-        load_model_from_previous_task(model, model_args.previous_task_model_path)
+        if training_args.lora_enable:
+            load_model_from_previous_task(
+                model,
+                model_args.previous_task_model_path,
+                load_lora_to_default=False,
+            )
+            load_previous_lora_as_frozen_adapter(
+                model,
+                model_args.previous_task_model_path,
+                training_args.old_lora_scale,
+            )
+        else:
+            load_model_from_previous_task(model, model_args.previous_task_model_path)
 
     if training_args.extract_description_cache_only:
         if model_args.previous_task_model_path is None:
@@ -1299,6 +1384,17 @@ def train():
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            has_frozen_old = any(".frozen_old." in name for name, _ in model.named_parameters())
+            if has_frozen_old:
+                frozen_old_state_dict = get_peft_state_for_adapter_maybe_zero_3(
+                    model.named_parameters(), "frozen_old", "none"
+                )
+                if frozen_old_state_dict:
+                    model.save_pretrained(
+                        training_args.output_dir,
+                        state_dict=frozen_old_state_dict,
+                        selected_adapters=["frozen_old"],
+                    )
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,

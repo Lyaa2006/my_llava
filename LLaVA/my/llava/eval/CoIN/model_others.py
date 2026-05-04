@@ -19,8 +19,15 @@ import math
 
 def split_list(lst, n):
     """Split a list into n (roughly) equal-sized chunks"""
+    if n <= 0:
+        raise ValueError("Number of chunks must be positive.")
+    if len(lst) == 0:
+        return [[] for _ in range(n)]
     chunk_size = math.ceil(len(lst) / n)  # integer division
-    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+    chunks = [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+    if len(chunks) < n:
+        chunks.extend([[] for _ in range(n - len(chunks))])
+    return chunks
 
 
 def get_chunk(lst, n, k):
@@ -87,7 +94,7 @@ def eval_model(args):
 
         with torch.inference_mode():
             output_ids = model.generate(
-                input_ids,
+                input_ids=input_ids,
                 images=image_tensor.unsqueeze(0).half().cuda(),
                 do_sample=True if args.temperature > 0 else False,
                 temperature=args.temperature,

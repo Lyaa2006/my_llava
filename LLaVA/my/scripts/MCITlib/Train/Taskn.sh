@@ -55,6 +55,8 @@ DESCRIPTION_MAX_TOKENS=${DESCRIPTION_MAX_TOKENS:-"32"}
 DESCRIPTION_ALIGN_WEIGHT=${DESCRIPTION_ALIGN_WEIGHT:-"1.0"}
 DESCRIPTION_UTILITY_WEIGHT=${DESCRIPTION_UTILITY_WEIGHT:-"1.0"}
 STANDARD_CE_WEIGHT=${STANDARD_CE_WEIGHT:-"1.0"}
+ORTH_LORA_WEIGHT=${ORTH_LORA_WEIGHT:-"0.0"}
+OLD_LORA_SCALE=${OLD_LORA_SCALE:-"1.0"}
 DESCRIPTION_CACHE_DIR=${DESCRIPTION_CACHE_DIR:-"$OUTPUT_DIR/reference_description_cache"}
 MAX_STEPS=$(read_optional_config "$TRAIN_CONFIG" max_steps -1)
 SAVE_STEPS=$(read_optional_config "$TRAIN_CONFIG" save_steps 50000)
@@ -175,4 +177,6 @@ fi
     --description_align_weight $DESCRIPTION_ALIGN_WEIGHT \
     --description_utility_weight $DESCRIPTION_UTILITY_WEIGHT \
     --standard_ce_weight $STANDARD_CE_WEIGHT \
+    --orth_lora_weight $ORTH_LORA_WEIGHT \
+    --old_lora_scale $OLD_LORA_SCALE \
     --report_to none

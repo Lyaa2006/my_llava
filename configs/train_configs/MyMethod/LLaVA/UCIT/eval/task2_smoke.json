@@ -1,6 +1,6 @@
 {
   "gpu_num": 1,
   "stage": "MyMethod-smoke-task2",
-  "model_path": "/mnt/lyaa/MCITlib/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task2_llava_lora_smoke",
+  "model_path": "/mnt/lyaa/my_llava/checkpoints/UCIT/LLaVA-1.5/MyMethod/Task2_llava_lora_smoke",
   "result_path": "./results/UCIT/each_dataset"
 }

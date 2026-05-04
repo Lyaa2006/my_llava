@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-HARD_PATH=/mnt/lyaa/MCITlib
+HARD_PATH=/mnt/lyaa/my_llava
 CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}
 
 pip install -e .

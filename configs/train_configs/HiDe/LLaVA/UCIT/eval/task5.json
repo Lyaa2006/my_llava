@@ -1,8 +1,8 @@
 {
   "gpu_num": 4,
   "stage": "HiDe-task5",
-  "model_path": "/mnt/lyaa/MCITlib/checkpoint/UCIT/LLaVA-1.5/HiDe/Task5_llava_lora",
+  "model_path": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task5_llava_lora",
   "result_path": "./results/UCIT/each_dataset",
-  "text_tower": "/mnt/lyaa/MCITlib/clip-vit-large-patch14-336",
+  "text_tower": "/mnt/lyaa/my_llava/clip-vit-large-patch14-336",
   "num_task": 6
 }

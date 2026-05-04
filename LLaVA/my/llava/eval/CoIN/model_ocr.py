@@ -115,7 +115,7 @@ def eval_model(args):
         # time.sleep(100)
         with torch.inference_mode():
             output_ids = model.generate(
-                input_ids,
+                input_ids=input_ids,
                 images=image_tensor.to(dtype=torch.float16, device='cuda'),
                 do_sample=False,
                 temperature=0,

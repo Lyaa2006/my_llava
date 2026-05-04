@@ -326,6 +326,43 @@ class LLaVATrainer(Trainer):
 
         return (1.0 - F.cosine_similarity(answer_summary, description_summary, dim=-1)).mean()
 
+    def _compute_lora_orthogonal_loss(self, model):
+        if getattr(self.args, "orth_lora_weight", 0.0) <= 0:
+            return None
+
+        losses = []
+        for module in model.modules():
+            if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+                continue
+            if "default" not in module.lora_A or "frozen_old" not in module.lora_A:
+                continue
+            if module.r["default"] <= 0 or module.r["frozen_old"] <= 0:
+                continue
+
+            current_a = module.lora_A["default"].weight.float()
+            current_b = module.lora_B["default"].weight.float()
+            with torch.no_grad():
+                previous_a = module.lora_A["frozen_old"].weight.float()
+                previous_b = module.lora_B["frozen_old"].weight.float()
+
+            # Frobenius cosine between low-rank deltas without materializing
+            # delta_W = B @ A, which is huge for LLaMA projection layers.
+            inner = (current_b.transpose(0, 1) @ previous_b) * (current_a @ previous_a.transpose(0, 1))
+            current_norm_sq = (current_b.transpose(0, 1) @ current_b) * (current_a @ current_a.transpose(0, 1))
+            with torch.no_grad():
+                previous_norm_sq = (previous_b.transpose(0, 1) @ previous_b) * (
+                    previous_a @ previous_a.transpose(0, 1)
+                )
+            numerator = inner.sum()
+            current_norm = current_norm_sq.sum().clamp_min(1e-12).sqrt()
+            previous_norm = previous_norm_sq.sum().clamp_min(1e-12).sqrt()
+            cosine = numerator / (current_norm * previous_norm).clamp_min(1e-12)
+            losses.append(cosine.pow(2))
+
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if not getattr(self.args, "enable_description_cl", False) or "description_input_ids" not in inputs:
             return super().compute_loss(model, inputs, return_outputs=return_outputs)
@@ -366,11 +403,15 @@ class LLaVATrainer(Trainer):
             valid_mask.sum().clamp_min(1.0) * current_description_states.shape[-1]
         )
 
+        lora_orthogonal_loss = self._compute_lora_orthogonal_loss(model)
+
         total_loss = (
             self.args.description_align_weight * description_align_loss
             + self.args.description_utility_weight * description_utility_loss
             + self.args.standard_ce_weight * standard_loss
         )
+        if lora_orthogonal_loss is not None:
+            total_loss = total_loss + self.args.orth_lora_weight * lora_orthogonal_loss
 
         if return_outputs:
             outputs = {
@@ -379,6 +420,8 @@ class LLaVATrainer(Trainer):
                 "description_utility_loss": description_utility_loss.detach(),
                 "description_align_loss": description_align_loss.detach(),
             }
+            if lora_orthogonal_loss is not None:
+                outputs["lora_orthogonal_loss"] = lora_orthogonal_loss.detach()
             return total_loss, outputs
         return total_loss
 

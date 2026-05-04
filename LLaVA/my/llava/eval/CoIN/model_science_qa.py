@@ -74,7 +74,7 @@ def eval_model(args):
 
         with torch.inference_mode():
             output_ids = model.generate(
-                input_ids,
+                input_ids=input_ids,
                 images=images,
                 image_sizes=image_sizes,
                 do_sample=True if args.temperature > 0 else False,

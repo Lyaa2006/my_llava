@@ -10,6 +10,23 @@ env
 ENV
 virtualenv/
 
+# Common env files (Conda / environment files)
+environment.yml
+environment-*.yml
+conda-lock.yml
+conda-lock.yaml
+
+# Conda / mamba directories and metadata
+.conda/
+conda-meta/
+pkgs/
+envs/
+
+# pip / wheel artifacts
+*.whl
+flash_attn*.whl
+pip-wheel-metadata/
+
 # Log
 *.log
 *.log.*
@@ -44,6 +61,19 @@ UCIT/*
 # Other
 .DS_Store
 results
+
+# IDE / editor / notebook
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# caches / test / tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+__pypackages__/
+
 
 # Allow committing MyMethod train configs (these are JSON by design)
 !configs/train_configs/MyMethod/**/*.json

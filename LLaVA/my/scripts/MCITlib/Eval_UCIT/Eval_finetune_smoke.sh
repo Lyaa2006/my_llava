@@ -2,7 +2,7 @@
 set -e
 
 TASK_ID=$1
-HARD_PATH=/mnt/lyaa/MCITlib
+HARD_PATH=/mnt/lyaa/my_llava
 CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}
 
 if [ "$TASK_ID" == "1" ]; then

@@ -17,6 +17,8 @@ DATA_PATH=$(read_config "$DATA_CONFIG" test_path)
 ANNOTATION=$(read_config "$DATA_CONFIG" anno_path)
 IMAGE=$(read_config "$DATA_CONFIG" test_folder)
 RESULT_PATH=$(read_config "$TRAIN_CONFIG" result_path)
+RUN_SUFFIX=${UCIT_RUN_ID:+_$UCIT_RUN_ID}
+STAGE="${STAGE}${RUN_SUFFIX}"
 
 gpu_list=""
 for ((i=0; i<GPU_NUM; i++)); do

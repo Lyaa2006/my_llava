@@ -1,6 +1,6 @@
 # #!/bin/bash
 
-HARD_PATH=/mnt/lyaa/MCITlib
+HARD_PATH=/mnt/lyaa/my_llava
 
 pip install -e .
 bash scripts/MCITlib/Eval_MLLM_DCL/eval_ad.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/MLLM-DCL/AD.json $HARD_PATH/configs/train_configs/LoRA-FT/LLaVA/MLLM-DCL/eval/zero_shot.json

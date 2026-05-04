@@ -22,6 +22,53 @@ import torch
 from llava.model import *
 from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 
+
+def _set_multi_lora_forward(model, old_lora_scale: float = 1.0):
+    model.old_lora_scale = old_lora_scale
+    for module in model.modules():
+        if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+            continue
+        if getattr(module, "_multi_lora_forward_wrapped", False):
+            module.old_lora_scale = old_lora_scale
+            continue
+        if not hasattr(module, "weight"):
+            continue
+
+        original_forward = module.forward
+
+        def multi_lora_forward(self, x: torch.Tensor):
+            result = self._single_lora_forward(x)
+
+            if self.disable_adapters or "frozen_old" not in self.lora_A:
+                return result
+
+            previous_scale = getattr(self, "old_lora_scale", 1.0)
+            if previous_scale == 0 or self.r["frozen_old"] <= 0:
+                return result
+
+            x_cast = x.to(self.lora_A["frozen_old"].weight.dtype)
+            output = self.lora_B["frozen_old"](self.lora_A["frozen_old"](x_cast))
+            output = output * self.scaling["frozen_old"] * previous_scale
+            return result + output.to(result.dtype)
+
+        module._single_lora_forward = original_forward
+        module.forward = multi_lora_forward.__get__(module, module.__class__)
+        module._multi_lora_forward_wrapped = True
+        module.old_lora_scale = old_lora_scale
+
+
+def _has_adapter_weights(adapter_dir: str):
+    weights_path = os.path.join(adapter_dir, "adapter_model.bin")
+    safe_weights_path = os.path.join(adapter_dir, "adapter_model.safetensors")
+    return (
+        os.path.exists(weights_path)
+        and os.path.getsize(weights_path) > 0
+    ) or (
+        os.path.exists(safe_weights_path)
+        and os.path.getsize(safe_weights_path) > 0
+    )
+
+
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
 
@@ -76,8 +123,17 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             from CoIN.peft import PeftModel
             print('Loading LoRA weights...')
             model = PeftModel.from_pretrained(model, model_path)
-            print('Merging LoRA weights...')
-            model = model.merge_and_unload()
+            frozen_old_path = os.path.join(model_path, "frozen_old")
+            if _has_adapter_weights(frozen_old_path):
+                print('Loading frozen old-task LoRA weights...')
+                model.load_adapter(frozen_old_path, adapter_name="frozen_old")
+                model.set_adapter("default")
+                _set_multi_lora_forward(model, old_lora_scale=1.0)
+                model.previous_adapter_name = "frozen_old"
+                print('Using stacked LoRA weights: default + frozen_old.')
+            else:
+                print('Merging LoRA weights...')
+                model = model.merge_and_unload()
             print('Model is loaded...')
         elif model_base is not None:
             # this may be mm projector only

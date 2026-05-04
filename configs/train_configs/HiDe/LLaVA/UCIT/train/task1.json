@@ -2,7 +2,7 @@
   "gpu_num": 1,
   "rank": 8,
   "expert_num": 2,
-  "output_dir": "/mnt/lyaa/MCITlib/checkpoint/UCIT/LLaVA-1.5/HiDe/Task1_llava_lora",
+  "output_dir": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task1_llava_lora",
   "epoch": 1,
   "batch_size": 1,
   "grad_acc": 1,

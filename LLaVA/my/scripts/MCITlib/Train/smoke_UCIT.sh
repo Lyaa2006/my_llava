@@ -1,10 +1,11 @@
 #!/bin/bash
 set -e
 
-HARD_PATH=/mnt/lyaa/MCITlib
+HARD_PATH=/mnt/lyaa/my_llava
 CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}
 DESCRIPTION_MAX_TOKENS=${DESCRIPTION_MAX_TOKENS:-8}
 DESCRIPTION_UTILITY_WEIGHT=${DESCRIPTION_UTILITY_WEIGHT:-0.2}
+export UCIT_RUN_ID="${UCIT_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 if [ "${SKIP_PIP_INSTALL:-0}" != "1" ]; then
     pip install -e . --no-build-isolation

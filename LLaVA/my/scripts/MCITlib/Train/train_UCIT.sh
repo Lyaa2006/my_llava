@@ -1,8 +1,16 @@
 #!/bin/bash
 set -e
 
-HARD_PATH=/mnt/lyaa/MCITlib
-CONFIG_ROOT=${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "$SCRIPT_DIR/../../..")"
+MCITLIB_ROOT_DEFAULT="$(realpath "$PROJECT_ROOT/../..")"
+
+HARD_PATH="${HARD_PATH:-${MCITLIB_ROOT:-$MCITLIB_ROOT_DEFAULT}}"
+CONFIG_ROOT="${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT}"
+
+cd "$PROJECT_ROOT"
+
+export UCIT_RUN_ID="${UCIT_RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
 if [ "${SKIP_PIP_INSTALL:-0}" != "1" ]; then
     pip install -e . --no-build-isolation
