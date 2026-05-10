@@ -37,6 +37,26 @@ print(sum(1 for sample in data if "image" in sample))
 PY
 }
 
+cache_meta_matches() {
+    python3 - "$1" "$2" "$3" "$4" "$5" <<'PY'
+import json, os, sys
+cache_dir, data_path, prompt, hidden_layer, max_tokens = sys.argv[1:]
+meta_path = os.path.join(cache_dir, "meta.json")
+if not os.path.exists(meta_path):
+    print("False")
+    raise SystemExit
+with open(meta_path, "r") as f:
+    meta = json.load(f)
+ok = (
+    meta.get("data_path") == data_path
+    and meta.get("description_prompt") == prompt
+    and str(meta.get("description_hidden_layer")) == str(hidden_layer)
+    and str(meta.get("description_max_tokens")) == str(max_tokens)
+)
+print("True" if ok else "False")
+PY
+}
+
 GPU_NUM=$(read_config "$TRAIN_CONFIG" gpu_num)
 RANK=$(read_config "$TRAIN_CONFIG" rank)
 MODEL_NAME=$(read_config "$MODEL_CONFIG" model_name)
@@ -49,7 +69,10 @@ EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)
 GRAD_ACC=$(read_config "$TRAIN_CONFIG" grad_acc)
 LR=$(read_config "$TRAIN_CONFIG" lr)
-DESCRIPTION_PROMPT=${DESCRIPTION_PROMPT:-"please describe this picture"}
+RUN_SUFFIX=${UCIT_RUN_ID:+_$UCIT_RUN_ID}
+OUTPUT_DIR="${OUTPUT_DIR}${RUN_SUFFIX}"
+PREVIOUS="${PREVIOUS}${RUN_SUFFIX}"
+DESCRIPTION_PROMPT=${DESCRIPTION_PROMPT:-"Describe the image using visual evidence: objects, attributes, shapes, colors, textures, scene context, visible text, and spatial relations."}
 DESCRIPTION_HIDDEN_LAYER=${DESCRIPTION_HIDDEN_LAYER:-"-2"}
 DESCRIPTION_MAX_TOKENS=${DESCRIPTION_MAX_TOKENS:-"32"}
 DESCRIPTION_ALIGN_WEIGHT=${DESCRIPTION_ALIGN_WEIGHT:-"1.0"}
@@ -58,6 +81,7 @@ STANDARD_CE_WEIGHT=${STANDARD_CE_WEIGHT:-"1.0"}
 ORTH_LORA_WEIGHT=${ORTH_LORA_WEIGHT:-"0.0"}
 OLD_LORA_SCALE=${OLD_LORA_SCALE:-"1.0"}
 DESCRIPTION_CACHE_DIR=${DESCRIPTION_CACHE_DIR:-"$OUTPUT_DIR/reference_description_cache"}
+FREEZE_MM_PROJECTOR=${FREEZE_MM_PROJECTOR:-"0"}
 MAX_STEPS=$(read_optional_config "$TRAIN_CONFIG" max_steps -1)
 SAVE_STEPS=$(read_optional_config "$TRAIN_CONFIG" save_steps 50000)
 DATALOADER_NUM_WORKERS=$(read_optional_config "$TRAIN_CONFIG" dataloader_num_workers 4)
@@ -72,8 +96,16 @@ CACHE_READY=False
 
 if [ -d "$DESCRIPTION_CACHE_DIR" ]; then
     EXISTING_CACHE_ENTRIES=$(find "$DESCRIPTION_CACHE_DIR" -maxdepth 1 -name '*.pt' | wc -l)
-    if [ "$EXISTING_CACHE_ENTRIES" -ge "$EXPECTED_CACHE_ENTRIES" ] && [ "$EXPECTED_CACHE_ENTRIES" -gt 0 ]; then
+    CACHE_META_READY=$(cache_meta_matches \
+        "$DESCRIPTION_CACHE_DIR" \
+        "$DATA_PATH" \
+        "$DESCRIPTION_PROMPT" \
+        "$DESCRIPTION_HIDDEN_LAYER" \
+        "$DESCRIPTION_MAX_TOKENS")
+    if [ "$EXISTING_CACHE_ENTRIES" -ge "$EXPECTED_CACHE_ENTRIES" ] && [ "$EXPECTED_CACHE_ENTRIES" -gt 0 ] && [ "$CACHE_META_READY" = "True" ]; then
         CACHE_READY=True
+    elif [ "$EXISTING_CACHE_ENTRIES" -gt 0 ]; then
+        echo "Description cache exists but metadata does not match current prompt/settings; rebuilding: $DESCRIPTION_CACHE_DIR"
     fi
 fi
 
@@ -132,6 +164,11 @@ if [ "$CACHE_READY" != "True" ]; then
         --extract_description_cache_only True
 fi
 
+FREEZE_MM_ARGS=()
+if [ "$FREEZE_MM_PROJECTOR" = "1" ]; then
+    FREEZE_MM_ARGS+=(--freeze_mm_mlp_adapter True)
+fi
+
 "${DEEPSPEED_PREFIX[@]}" "${DEEPSPEED_ARGS[@]}" llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --lora_enable True --lora_r $RANK --lora_alpha $((RANK * 2)) --mm_projector_lr 2e-5 \
@@ -179,4 +216,5 @@ fi
     --standard_ce_weight $STANDARD_CE_WEIGHT \
     --orth_lora_weight $ORTH_LORA_WEIGHT \
     --old_lora_scale $OLD_LORA_SCALE \
+    "${FREEZE_MM_ARGS[@]}" \
     --report_to none

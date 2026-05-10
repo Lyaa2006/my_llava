@@ -1057,7 +1057,25 @@ def train(attn_implementation=None):
         if training_args.local_rank == 0 or training_args.local_rank == -1:
             model.config.save_pretrained(training_args.output_dir)
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
-            torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            # If there's a previous task checkpoint, try to include its non_lora_trainables
+            prev_path = getattr(model_args, 'previous_task_model_path', None)
+            out_file = os.path.join(training_args.output_dir, 'non_lora_trainables.bin')
+            if prev_path:
+                prev_file = os.path.join(prev_path, 'non_lora_trainables.bin')
+                if os.path.exists(prev_file):
+                    try:
+                        prev_non_lora = torch.load(prev_file, map_location='cpu')
+                        # Merge previous -> current (current overrides keys present)
+                        merged = dict(prev_non_lora)
+                        merged.update(non_lora_state_dict)
+                        torch.save(merged, out_file)
+                    except Exception as e:
+                        print(f"Warning: failed to load/merge previous non_lora_trainables from {prev_file}: {e}")
+                        torch.save(non_lora_state_dict, out_file)
+                else:
+                    torch.save(non_lora_state_dict, out_file)
+            else:
+                torch.save(non_lora_state_dict, out_file)
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)

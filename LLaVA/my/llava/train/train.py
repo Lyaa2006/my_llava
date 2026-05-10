@@ -42,10 +42,30 @@ ImageFile.LOAD_TRUNCATED_IMAGES = True
 Image.MAX_IMAGE_PIXELS=None
 
 local_rank = None
+DESCRIPTION_KEY_TERMS = (
+    "object",
+    "objects",
+    "attribute",
+    "attributes",
+    "shape",
+    "shapes",
+    "color",
+    "colors",
+    "texture",
+    "textures",
+    "scene",
+    "context",
+    "visible",
+    "text",
+    "spatial",
+    "relation",
+    "relations",
+    "evidence",
+)
 
 
 def rank0_print(*args):
-    if local_rank == 0:
+    if local_rank in (None, -1, 0):
         print(*args)
 
 
@@ -71,7 +91,12 @@ class DataArguments:
                            metadata={"help": "Path to the training data."})
     memory_data_path: str = field(default=None,
                            metadata={"help": "Path to the memory data."})
-    description_prompt: str = field(default="please describe this picture")
+    description_prompt: str = field(
+        default=(
+            "Describe the image using visual evidence: objects, attributes, shapes, colors, "
+            "textures, scene context, visible text, and spatial relations."
+        )
+    )
     description_cache_dir: Optional[str] = field(default=None)
     lazy_preprocess: bool = False
     is_multimodal: bool = False
@@ -124,6 +149,8 @@ class TrainingArguments(transformers.TrainingArguments):
     standard_ce_weight: float = field(default=1.0)
     orth_lora_weight: float = field(default=0.0)
     old_lora_scale: float = field(default=1.0)
+    orth_lora_last_n_layers: int = field(default=4)
+    orth_lora_target_modules: str = field(default="q_proj,v_proj,o_proj,down_proj")
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -715,6 +742,34 @@ def pad_description_sequences(sequences: Sequence[torch.Tensor],
     }
 
 
+def build_description_key_mask(input_ids: torch.Tensor,
+                               tokenizer: transformers.PreTrainedTokenizer,
+                               attention_mask: torch.Tensor) -> torch.Tensor:
+    key_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+    special_token_ids = set(tokenizer.all_special_ids)
+    vocab_size = len(tokenizer)
+    for batch_idx in range(input_ids.shape[0]):
+        cur_len = int(attention_mask[batch_idx].long().sum().item())
+        for token_idx in range(cur_len):
+            token_id = int(input_ids[batch_idx, token_idx].item())
+            if token_id < 0 or token_id >= vocab_size:
+                continue
+            if token_id in special_token_ids:
+                continue
+            try:
+                token_text = tokenizer.decode([token_id], skip_special_tokens=True).strip().lower()
+            except OverflowError:
+                continue
+            token_text = "".join(ch for ch in token_text if ch.isalnum())
+            if not token_text:
+                continue
+            if any(term in token_text or token_text in term for term in DESCRIPTION_KEY_TERMS):
+                key_mask[batch_idx, token_idx] = True
+        if not torch.any(key_mask[batch_idx, :cur_len]):
+            key_mask[batch_idx, :cur_len] = attention_mask[batch_idx, :cur_len].bool()
+    return key_mask
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
@@ -830,27 +885,29 @@ class LazySupervisedDataset(Dataset):
                              labels=data_dict["labels"][0])
 
         # image exist in the data
+        use_description_data = getattr(self.data_args, "use_description_data", False)
         if 'image' in self.list_data_dict[i]:
             data_dict['image'] = image
-            description_text = build_multimodal_instruction_text(
-                self.data_args.description_prompt,
-                self.data_args,
-                image_count=image_count,
-            )
-            description_prompt = build_single_turn_prompt(description_text)
-            data_dict["description_input_ids"] = tokenizer_image_token(
-                description_prompt,
-                self.tokenizer,
-                return_tensors='pt',
-            )
-            data_dict["description_cache_key"] = self.list_data_dict[i]["_description_cache_key"]
-            if self.data_args.description_cache_dir is not None:
-                cache_path = get_description_cache_path(
-                    self.data_args.description_cache_dir,
-                    data_dict["description_cache_key"],
+            if use_description_data:
+                description_text = build_multimodal_instruction_text(
+                    self.data_args.description_prompt,
+                    self.data_args,
+                    image_count=image_count,
                 )
-                if os.path.exists(cache_path):
-                    data_dict["reference_description_states"] = torch.load(cache_path, map_location="cpu")
+                description_prompt = build_single_turn_prompt(description_text)
+                data_dict["description_input_ids"] = tokenizer_image_token(
+                    description_prompt,
+                    self.tokenizer,
+                    return_tensors='pt',
+                )
+                data_dict["description_cache_key"] = self.list_data_dict[i]["_description_cache_key"]
+                if self.data_args.description_cache_dir is not None:
+                    cache_path = get_description_cache_path(
+                        self.data_args.description_cache_dir,
+                        data_dict["description_cache_key"],
+                    )
+                    if os.path.exists(cache_path):
+                        data_dict["reference_description_states"] = torch.load(cache_path, map_location="cpu")
         elif self.data_args.is_multimodal:
             # image does not exist in the data, but the model is multimodal
             crop_size = self.data_args.image_processor.crop_size
@@ -926,6 +983,11 @@ class DataCollatorForSupervisedDataset(object):
             description_input_ids = description_input_ids[:, :self.tokenizer.model_max_length]
             batch["description_input_ids"] = description_input_ids
             batch["description_attention_mask"] = description_input_ids.ne(self.tokenizer.pad_token_id)
+            batch["description_key_mask"] = build_description_key_mask(
+                description_input_ids,
+                self.tokenizer,
+                batch["description_attention_mask"],
+            )
             batch["description_cache_keys"] = [instance["description_cache_key"] for instance in instances]
 
         if 'reference_description_states' in instances[0]:
@@ -1167,6 +1229,9 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    data_args.use_description_data = (
+        training_args.enable_description_cl or training_args.extract_description_cache_only
+    )
     if training_args.enable_description_cl and training_args.gradient_checkpointing:
         rank0_print(
             "Disabling gradient checkpointing because description continual-learning "

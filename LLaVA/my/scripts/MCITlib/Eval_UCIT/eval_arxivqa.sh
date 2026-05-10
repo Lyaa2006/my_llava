@@ -17,6 +17,7 @@ DATA_PATH=$(read_config "$DATA_CONFIG" test_path)
 IMAGE=$(read_config "$DATA_CONFIG" test_folder)
 RESULT_PATH=$(read_config "$TRAIN_CONFIG" result_path)
 RUN_SUFFIX=${UCIT_RUN_ID:+_$UCIT_RUN_ID}
+MODELPATH="${MODELPATH}${RUN_SUFFIX}"
 STAGE="${STAGE}${RUN_SUFFIX}"
 
 gpu_list=""

@@ -40,7 +40,10 @@ EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)
 GRAD_ACC=$(read_config "$TRAIN_CONFIG" grad_acc)
 LR=$(read_config "$TRAIN_CONFIG" lr)
-DESCRIPTION_PROMPT=${DESCRIPTION_PROMPT:-"please describe this picture"}
+RUN_SUFFIX=${UCIT_RUN_ID:+_$UCIT_RUN_ID}
+OUTPUT_DIR="${OUTPUT_DIR}${RUN_SUFFIX}"
+DESCRIPTION_PROMPT=${DESCRIPTION_PROMPT:-"Describe the image using visual evidence: objects, attributes, shapes, colors, textures, scene context, visible text, and spatial relations."}
+FREEZE_MM_PROJECTOR=${FREEZE_MM_PROJECTOR:-"0"}
 MAX_STEPS=$(read_optional_config "$TRAIN_CONFIG" max_steps -1)
 SAVE_STEPS=$(read_optional_config "$TRAIN_CONFIG" save_steps 50000)
 DATALOADER_NUM_WORKERS=$(read_optional_config "$TRAIN_CONFIG" dataloader_num_workers 4)
@@ -75,6 +78,11 @@ DEEPSPEED_ARGS+=(--master_port "$MASTER_PORT")
 # PROMPT_VERSION="llava_llama_2"
 # MODEL_VERSION="Llama-2-7b-chat-hf"
 ################## LLaMA-2 ##################
+
+FREEZE_MM_ARGS=()
+if [ "$FREEZE_MM_PROJECTOR" = "1" ]; then
+    FREEZE_MM_ARGS+=(--freeze_mm_mlp_adapter True)
+fi
 
 "${DEEPSPEED_PREFIX[@]}" "${DEEPSPEED_ARGS[@]}" llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
@@ -115,4 +123,5 @@ DEEPSPEED_ARGS+=(--master_port "$MASTER_PORT")
     --lazy_preprocess True \
     --description_prompt "$DESCRIPTION_PROMPT" \
     --enable_description_cl False \
+    "${FREEZE_MM_ARGS[@]}" \
     --report_to none

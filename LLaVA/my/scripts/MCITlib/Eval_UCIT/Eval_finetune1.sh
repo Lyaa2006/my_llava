@@ -1,4 +1,5 @@
-# #!/bin/bash
+#!/bin/bash
+set -e
 
 TASK_ID=$1
 
@@ -11,11 +12,24 @@ CONFIG_ROOT="${CONFIG_ROOT:-$HARD_PATH/configs/train_configs/MyMethod/LLaVA/UCIT
 
 cd "$PROJECT_ROOT"
 
+UCIT_SMOKE="${UCIT_SMOKE:-0}"
+if [ "$UCIT_SMOKE" = "1" ]; then
+    IMAGENET_DATA="$HARD_PATH/configs/data_configs/UCIT/ImageNet-R-smoke.json"
+    ARXIVQA_DATA="$HARD_PATH/configs/data_configs/UCIT/ArxivQA-smoke.json"
+    TASK1_EVAL="$CONFIG_ROOT/eval/task1_smoke.json"
+    TASK2_EVAL="$CONFIG_ROOT/eval/task2_smoke.json"
+else
+    IMAGENET_DATA="$HARD_PATH/configs/data_configs/UCIT/ImageNet-R.json"
+    ARXIVQA_DATA="$HARD_PATH/configs/data_configs/UCIT/ArxivQA.json"
+    TASK1_EVAL="$CONFIG_ROOT/eval/task1.json"
+    TASK2_EVAL="$CONFIG_ROOT/eval/task2.json"
+fi
+
 if [ "$TASK_ID" == "1" ]; then
-    bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ImageNet-R.json $CONFIG_ROOT/eval/task1.json
+    bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json "$IMAGENET_DATA" "$TASK1_EVAL"
 elif [ "$TASK_ID" == "2" ]; then
-    bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ImageNet-R.json $CONFIG_ROOT/eval/task2.json
-    bash scripts/MCITlib/Eval_UCIT/eval_arxivqa.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ArxivQA.json $CONFIG_ROOT/eval/task2.json
+    bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json "$IMAGENET_DATA" "$TASK2_EVAL"
+    bash scripts/MCITlib/Eval_UCIT/eval_arxivqa.sh $HARD_PATH/configs/modal_configs/llava.json "$ARXIVQA_DATA" "$TASK2_EVAL"
 elif [ "$TASK_ID" == "3" ]; then
     bash scripts/MCITlib/Eval_UCIT/eval_imagenet.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ImageNet-R.json $CONFIG_ROOT/eval/task3.json
     bash scripts/MCITlib/Eval_UCIT/eval_arxivqa.sh $HARD_PATH/configs/modal_configs/llava.json $HARD_PATH/configs/data_configs/UCIT/ArxivQA.json $CONFIG_ROOT/eval/task3.json

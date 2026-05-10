@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import torch.nn.functional as F
 
@@ -15,7 +16,7 @@ from transformers.trainer import (
 )
 from typing import List, Optional
 
-from llava.constants import IGNORE_INDEX
+from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -262,7 +263,43 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
-    def _extract_description_states(self, model, inputs):
+    def _extract_description_states(self, model, inputs, compute_lora_orth=False):
+        lora_losses = []
+        hooks = []
+        if compute_lora_orth and getattr(self.args, "orth_lora_weight", 0.0) > 0:
+            targets = self._iter_lora_activation_targets(model)
+            self._last_lora_orth_target_count = len(targets)
+
+            def build_hook(module):
+                def hook(module, hook_inputs, hook_outputs):
+                    if not hook_inputs:
+                        return
+                    hidden = hook_inputs[0]
+                    if hidden is None:
+                        return
+
+                    dropout = self._get_lora_dropout(module, "default")
+                    if dropout is None:
+                        dropout = torch.nn.Identity()
+
+                    current_scale = self._get_lora_scaling(module, "default")
+                    old_scale = self._get_lora_scaling(module, "frozen_old") * getattr(self.args, "old_lora_scale", 1.0)
+
+                    current_input = dropout(hidden)
+                    current_output = module.lora_B["default"](module.lora_A["default"](current_input)) * current_scale
+
+                    with torch.no_grad():
+                        old_input = dropout(hidden.detach())
+                        old_output = module.lora_B["frozen_old"](module.lora_A["frozen_old"](old_input)) * old_scale
+
+                    cosine = F.cosine_similarity(current_output.float(), old_output.float(), dim=-1)
+                    lora_losses.append(cosine.pow(2).mean())
+
+                return hook
+
+            for module in targets:
+                hooks.append(module.register_forward_hook(build_hook(module)))
+
         description_outputs = model(
             input_ids=inputs["description_input_ids"],
             attention_mask=inputs["description_attention_mask"],
@@ -271,13 +308,87 @@ class LLaVATrainer(Trainer):
             return_dict=True,
             use_cache=False,
         )
+        for hook in hooks:
+            hook.remove()
+
+        lora_orth_loss = torch.stack(lora_losses).mean() if lora_losses else None
+        if compute_lora_orth:
+            self._last_lora_orth_loss_count = len(lora_losses)
         hidden_states = description_outputs.hidden_states[self.args.description_hidden_layer]
         description_sequences = []
+        key_mask_sequences = []
+        description_key_mask = inputs.get("description_key_mask")
         lengths = inputs["description_attention_mask"].long().sum(dim=1).tolist()
         for batch_idx, cur_len in enumerate(lengths):
             start_idx = max(0, cur_len - self.args.description_max_tokens)
             description_sequences.append(hidden_states[batch_idx, start_idx:cur_len])
-        return description_sequences
+            if description_key_mask is not None:
+                key_mask_sequences.append(description_key_mask[batch_idx, start_idx:cur_len])
+        if description_key_mask is None:
+            if compute_lora_orth:
+                return description_sequences, None, lora_orth_loss
+            return description_sequences, None
+        if compute_lora_orth:
+            return description_sequences, key_mask_sequences, lora_orth_loss
+        return description_sequences, key_mask_sequences
+
+    def _get_lora_dropout(self, module, adapter_name):
+        dropout = getattr(module, "lora_dropout", None)
+        if dropout is None:
+            return None
+        if isinstance(dropout, (dict, torch.nn.ModuleDict)):
+            return dropout[adapter_name] if adapter_name in dropout else None
+        return dropout
+
+    def _get_lora_scaling(self, module, adapter_name):
+        scaling = getattr(module, "scaling", 1.0)
+        if isinstance(scaling, dict):
+            return scaling.get(adapter_name, 1.0)
+        return scaling
+
+    def _iter_lora_activation_targets(self, model):
+        total_layers = getattr(getattr(model, "config", None), "num_hidden_layers", None)
+        if total_layers is None:
+            base_model = getattr(model, "model", None)
+            total_layers = getattr(getattr(base_model, "config", None), "num_hidden_layers", None)
+        target_modules = getattr(self.args, "orth_lora_target_modules", "q_proj,v_proj,o_proj,down_proj")
+        target_modules = {name.strip() for name in target_modules.split(",") if name.strip()}
+
+        named_lora_modules = []
+        layer_ids = []
+        for name, module in model.named_modules():
+            if not target_modules:
+                break
+            if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
+                continue
+            if "default" not in module.lora_A or "frozen_old" not in module.lora_A:
+                continue
+            if module.r.get("default", 0) <= 0 or module.r.get("frozen_old", 0) <= 0:
+                continue
+            if not any(name.endswith(f".{suffix}") for suffix in target_modules):
+                continue
+            match = re.search(r"(?:^|\.)layers\.(\d+)(?:\.|$)", name)
+            if match is None:
+                continue
+            layer_id = int(match.group(1))
+            named_lora_modules.append((name, module, layer_id))
+            layer_ids.append(layer_id)
+
+        if not named_lora_modules:
+            return []
+        if total_layers is None:
+            total_layers = max(layer_ids) + 1
+
+        last_n = getattr(self.args, "orth_lora_last_n_layers", 4)
+        last_n = max(1, int(last_n))
+        target_layers = set(range(max(0, total_layers - last_n), total_layers))
+
+        targets = []
+        for _, module, layer_id in named_lora_modules:
+            if layer_id not in target_layers:
+                continue
+            targets.append(module)
+        return targets
 
     def _pad_description_sequences(self, sequences, dtype=None):
         max_len = max(seq.shape[0] for seq in sequences)
@@ -293,6 +404,15 @@ class LLaVATrainer(Trainer):
             mask[idx, :seq_len] = True
         return padded, mask
 
+    def _pad_description_key_masks(self, masks, max_len, device):
+        if masks is None:
+            return None
+        padded = torch.zeros((len(masks), max_len), dtype=torch.bool, device=device)
+        for idx, mask in enumerate(masks):
+            seq_len = min(mask.shape[0], max_len)
+            padded[idx, :seq_len] = mask[:seq_len].to(device=device, dtype=torch.bool)
+        return padded
+
     def _masked_mean_pool(self, hidden_states, mask):
         if hidden_states.shape[1] != mask.shape[1]:
             shared_seq_len = min(hidden_states.shape[1], mask.shape[1])
@@ -306,62 +426,169 @@ class LLaVATrainer(Trainer):
         mask = mask.unsqueeze(-1).to(dtype=hidden_states.dtype)
         return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
 
-    def _compute_description_utility_loss(self, standard_outputs, inputs, description_states):
-        current_description_states, current_description_mask = self._pad_description_sequences(description_states)
-        description_summary = self._masked_mean_pool(current_description_states.float(), current_description_mask)
+    def _truncate_preserving_targets(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        max_length: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if input_ids.shape[0] <= max_length:
+            return input_ids, labels
 
-        answer_hidden_states = standard_outputs.hidden_states[self.args.description_hidden_layer]
-        prepared_labels = getattr(standard_outputs, "prepared_labels", None)
-        prepared_attention_mask = getattr(standard_outputs, "prepared_attention_mask", None)
-        if prepared_labels is not None:
-            answer_mask = prepared_labels.ne(IGNORE_INDEX)
-        else:
+        target_positions = torch.nonzero(labels.ne(IGNORE_INDEX), as_tuple=False).flatten()
+        if target_positions.numel() == 0 or target_positions[-1].item() < max_length:
+            return input_ids[:max_length], labels[:max_length]
+
+        prefix_len = min(64, max_length - target_positions.numel())
+        suffix_len = max_length - prefix_len
+        input_ids = torch.cat((input_ids[:prefix_len], input_ids[-suffix_len:]), dim=0)
+        labels = torch.cat((labels[:prefix_len], labels[-suffix_len:]), dim=0)
+        return input_ids, labels
+
+    def _build_text_only_batch(self, inputs: dict, prefix_len: int) -> dict:
+        if "input_ids" not in inputs or "labels" not in inputs or "attention_mask" not in inputs:
+            raise ValueError("Building description-utility batch requires input_ids, labels, and attention_mask.")
+
+        max_length = int(getattr(self.args, "model_max_length", 2048) or 2048)
+        max_text_len = max(1, max_length - prefix_len)
+        device = inputs["input_ids"].device
+
+        sequences = []
+        label_sequences = []
+        for idx in range(inputs["input_ids"].shape[0]):
+            cur_attention = inputs["attention_mask"][idx].bool()
+            cur_input_ids = inputs["input_ids"][idx][cur_attention]
+            cur_labels = inputs["labels"][idx][cur_attention]
+
+            keep_mask = cur_input_ids.ne(IMAGE_TOKEN_INDEX)
+            cur_input_ids = cur_input_ids[keep_mask]
+            cur_labels = cur_labels[keep_mask]
+
+            cur_input_ids, cur_labels = self._truncate_preserving_targets(cur_input_ids, cur_labels, max_text_len)
+            sequences.append(cur_input_ids)
+            label_sequences.append(cur_labels)
+
+        pad_token_id = int(getattr(self.tokenizer, "pad_token_id", 0) or 0)
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            sequences,
+            batch_first=True,
+            padding_value=pad_token_id,
+        ).to(device=device)
+        labels = torch.nn.utils.rnn.pad_sequence(
+            label_sequences,
+            batch_first=True,
+            padding_value=IGNORE_INDEX,
+        ).to(device=device)
+        attention_mask = input_ids.ne(pad_token_id)
+        return {"input_ids": input_ids, "labels": labels, "attention_mask": attention_mask}
+
+    def _compute_description_utility_loss(self, model, inputs, description_states):
+        base_model = getattr(model, "module", model)
+        model_type = getattr(getattr(base_model, "config", None), "model_type", None)
+        if model_type is not None and "mpt" in str(model_type):
+            current_description_states, current_description_mask = self._pad_description_sequences(description_states)
+            description_summary = self._masked_mean_pool(current_description_states.float(), current_description_mask)
             answer_mask = inputs["labels"].ne(IGNORE_INDEX)
-        if not torch.any(answer_mask):
-            if prepared_attention_mask is not None:
-                answer_mask = prepared_attention_mask.bool()
-            else:
+            if not torch.any(answer_mask):
                 answer_mask = inputs["attention_mask"].bool()
-        answer_summary = self._masked_mean_pool(answer_hidden_states.float(), answer_mask)
+            answer_hidden_states = model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                labels=inputs["labels"],
+                images=inputs.get("images"),
+                return_dict=True,
+                output_hidden_states=True,
+                use_cache=False,
+            ).hidden_states[self.args.description_hidden_layer]
+            answer_summary = self._masked_mean_pool(answer_hidden_states.float(), answer_mask)
+            return (1.0 - F.cosine_similarity(answer_summary, description_summary, dim=-1)).mean()
 
-        return (1.0 - F.cosine_similarity(answer_summary, description_summary, dim=-1)).mean()
+        prefix_states, prefix_mask = self._pad_description_sequences(description_states)
+        prefix_embeds = prefix_states.to(dtype=base_model.get_input_embeddings().weight.dtype)
+        prefix_attention_mask = prefix_mask
+        prefix_len = prefix_embeds.shape[1]
 
-    def _compute_lora_orthogonal_loss(self, model):
+        text_batch = self._build_text_only_batch(inputs, prefix_len=prefix_len)
+        token_embeds = base_model.get_input_embeddings()(text_batch["input_ids"])
+
+        inputs_embeds = torch.cat((prefix_embeds, token_embeds), dim=1)
+        attention_mask = torch.cat((prefix_attention_mask, text_batch["attention_mask"]), dim=1)
+        prefix_labels = torch.full(
+            (text_batch["labels"].shape[0], prefix_len),
+            IGNORE_INDEX,
+            dtype=text_batch["labels"].dtype,
+            device=text_batch["labels"].device,
+        )
+        labels = torch.cat((prefix_labels, text_batch["labels"]), dim=1)
+
+        utility_outputs = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            labels=labels,
+            return_dict=True,
+            use_cache=False,
+        )
+        return utility_outputs.loss
+
+    def _compute_lora_orthogonal_loss(self, model, inputs):
         if getattr(self.args, "orth_lora_weight", 0.0) <= 0:
             return None
-
-        losses = []
-        for module in model.modules():
-            if not hasattr(module, "lora_A") or not hasattr(module, "lora_B"):
-                continue
-            if "default" not in module.lora_A or "frozen_old" not in module.lora_A:
-                continue
-            if module.r["default"] <= 0 or module.r["frozen_old"] <= 0:
-                continue
-
-            current_a = module.lora_A["default"].weight.float()
-            current_b = module.lora_B["default"].weight.float()
-            with torch.no_grad():
-                previous_a = module.lora_A["frozen_old"].weight.float()
-                previous_b = module.lora_B["frozen_old"].weight.float()
-
-            # Frobenius cosine between low-rank deltas without materializing
-            # delta_W = B @ A, which is huge for LLaMA projection layers.
-            inner = (current_b.transpose(0, 1) @ previous_b) * (current_a @ previous_a.transpose(0, 1))
-            current_norm_sq = (current_b.transpose(0, 1) @ current_b) * (current_a @ current_a.transpose(0, 1))
-            with torch.no_grad():
-                previous_norm_sq = (previous_b.transpose(0, 1) @ previous_b) * (
-                    previous_a @ previous_a.transpose(0, 1)
-                )
-            numerator = inner.sum()
-            current_norm = current_norm_sq.sum().clamp_min(1e-12).sqrt()
-            previous_norm = previous_norm_sq.sum().clamp_min(1e-12).sqrt()
-            cosine = numerator / (current_norm * previous_norm).clamp_min(1e-12)
-            losses.append(cosine.pow(2))
-
-        if not losses:
+        if "description_input_ids" not in inputs:
             return None
-        return torch.stack(losses).mean()
+        _, _, lora_orth_loss = self._extract_description_states(model, inputs, compute_lora_orth=True)
+        return lora_orth_loss
+
+    def _maybe_log_description_losses(
+        self,
+        total_loss,
+        standard_loss,
+        description_align_loss,
+        description_utility_loss,
+        lora_orthogonal_loss,
+        valid_token_count,
+        base_valid_token_count,
+        shared_seq_len,
+    ):
+        logging_steps = max(1, int(getattr(self.args, "logging_steps", 1) or 1))
+        global_step = int(getattr(self.state, "global_step", 0))
+        if global_step % logging_steps != 0:
+            return
+        if getattr(self, "_last_description_loss_log_step", None) == global_step:
+            return
+        self._last_description_loss_log_step = global_step
+
+        align_weight = float(getattr(self.args, "description_align_weight", 1.0))
+        utility_weight = float(getattr(self.args, "description_utility_weight", 1.0))
+        ce_weight = float(getattr(self.args, "standard_ce_weight", 1.0))
+        orth_weight = float(getattr(self.args, "orth_lora_weight", 0.0))
+        base_valid = base_valid_token_count.detach().float().clamp_min(1.0)
+        used_valid = valid_token_count.detach().float()
+
+        logs = {
+            "loss/total": total_loss.detach().float().item(),
+            "loss/standard_ce": standard_loss.detach().float().item(),
+            "loss/description_align": description_align_loss.detach().float().item(),
+            "loss/description_utility": description_utility_loss.detach().float().item(),
+            "loss_weighted/standard_ce": (standard_loss.detach().float() * ce_weight).item(),
+            "loss_weighted/description_align": (description_align_loss.detach().float() * align_weight).item(),
+            "loss_weighted/description_utility": (description_utility_loss.detach().float() * utility_weight).item(),
+            "description/align_token_fraction": (used_valid / base_valid).item(),
+            "description/align_tokens": used_valid.item(),
+            "description/base_valid_tokens": base_valid_token_count.detach().float().item(),
+            "description/shared_seq_len": float(shared_seq_len),
+            "config/description_align_weight": align_weight,
+            "config/description_utility_weight": utility_weight,
+            "config/standard_ce_weight": ce_weight,
+            "config/old_lora_scale": float(getattr(self.args, "old_lora_scale", 1.0)),
+            "config/orth_lora_weight": orth_weight,
+            "config/orth_lora_last_n_layers": float(getattr(self.args, "orth_lora_last_n_layers", 4)),
+        }
+        if lora_orthogonal_loss is not None:
+            logs["loss/lora_activation_orth"] = lora_orthogonal_loss.detach().float().item()
+            logs["loss_weighted/lora_activation_orth"] = (
+                lora_orthogonal_loss.detach().float() * orth_weight
+            ).item()
+        self.log(logs)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if not getattr(self.args, "enable_description_cl", False) or "description_input_ids" not in inputs:
@@ -373,7 +600,7 @@ class LLaVATrainer(Trainer):
             labels=inputs["labels"],
             images=inputs.get("images"),
             return_dict=True,
-            output_hidden_states=True,
+            output_hidden_states=False,
             use_cache=False,
         )
         standard_loss = standard_outputs.loss
@@ -381,8 +608,15 @@ class LLaVATrainer(Trainer):
         if "reference_description_states" not in inputs or "reference_description_mask" not in inputs:
             raise ValueError("Description continual-learning loss requires offline cached reference description states.")
 
-        description_states = self._extract_description_states(model, inputs)
-        description_utility_loss = self._compute_description_utility_loss(standard_outputs, inputs, description_states)
+        compute_lora_orth = getattr(self.args, "orth_lora_weight", 0.0) > 0
+        if compute_lora_orth:
+            description_states, description_key_masks, lora_orthogonal_loss = self._extract_description_states(
+                model, inputs, compute_lora_orth=True
+            )
+        else:
+            description_states, description_key_masks = self._extract_description_states(model, inputs)
+            lora_orthogonal_loss = None
+        description_utility_loss = self._compute_description_utility_loss(model, inputs, description_states)
 
         current_description_states, current_description_mask = self._pad_description_sequences(
             description_states,
@@ -396,14 +630,23 @@ class LLaVATrainer(Trainer):
         reference_description_states = reference_description_states[:, :shared_seq_len]
         reference_description_mask = reference_description_mask[:, :shared_seq_len]
         valid_mask = current_description_mask & reference_description_mask
+        base_valid_token_count = valid_mask.float().sum()
+        description_key_mask = self._pad_description_key_masks(
+            description_key_masks,
+            shared_seq_len,
+            current_description_states.device,
+        )
+        if description_key_mask is not None:
+            key_valid_mask = valid_mask & description_key_mask[:, :shared_seq_len]
+            has_key_tokens = key_valid_mask.any(dim=1, keepdim=True)
+            valid_mask = torch.where(has_key_tokens, key_valid_mask, valid_mask)
+        valid_token_count = valid_mask.float().sum()
 
         diff = (current_description_states.float() - reference_description_states.float()) ** 2
         valid_mask = valid_mask.unsqueeze(-1).float()
         description_align_loss = (diff * valid_mask).sum() / (
             valid_mask.sum().clamp_min(1.0) * current_description_states.shape[-1]
         )
-
-        lora_orthogonal_loss = self._compute_lora_orthogonal_loss(model)
 
         total_loss = (
             self.args.description_align_weight * description_align_loss
@@ -412,6 +655,17 @@ class LLaVATrainer(Trainer):
         )
         if lora_orthogonal_loss is not None:
             total_loss = total_loss + self.args.orth_lora_weight * lora_orthogonal_loss
+
+        self._maybe_log_description_losses(
+            total_loss=total_loss,
+            standard_loss=standard_loss,
+            description_align_loss=description_align_loss,
+            description_utility_loss=description_utility_loss,
+            lora_orthogonal_loss=lora_orthogonal_loss,
+            valid_token_count=valid_token_count,
+            base_valid_token_count=base_valid_token_count,
+            shared_seq_len=shared_seq_len,
+        )
 
         if return_outputs:
             outputs = {
