@@ -1,5 +1,6 @@
 {
   "model_name": "/mnt/lyaa/my_llava/llava-v1.5-7b",
   "mm_projector": "/mnt/lyaa/my_llava/llava-v1.5-7b/mm_projector.bin",
-  "vision_tower": "/mnt/lyaa/my_llava/clip-vit-large-patch14-336"
+  "vision_tower": "/mnt/lyaa/my_llava/clip-vit-large-patch14-336",
+  "text_tower": "/mnt/lyaa/my_llava/clip-vit-large-patch14-336"
 }

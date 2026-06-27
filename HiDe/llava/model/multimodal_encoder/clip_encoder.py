@@ -105,13 +105,11 @@ class CLIPTextTower(nn.Module):
 
     @torch.no_grad()
     def forward(self, text_inputs, return_hidden_states=False):
-        # if type(texts_input_ids) is list:
-        #     text_features = []
-        #     for text_input_ids in texts_input_ids:
-        #         text_forward_out = self.text_tower(text_input_ids.to(self.device, dtype=self.dtype).unsqueeze(0), output_hidden_states=True)
-        #         text_feature = self.feature_select(text_forward_out).to(text_input_ids.dtype)
-        #         text_features.append(text_feature)
-        # else:
+        # Lazily load the underlying CLIP text model if it was created with delay_load=True
+        if not self.is_loaded:
+            # load_model will set self.text_tower and mark as loaded
+            self.load_model()
+
         text_forward_outs = self.text_tower(**(text_inputs.to(self.device)))
         if return_hidden_states:
             text_hidden_features = text_forward_outs.last_hidden_state.to(self.dtype)

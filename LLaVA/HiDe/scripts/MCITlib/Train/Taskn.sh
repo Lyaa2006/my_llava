@@ -13,8 +13,16 @@ read_config() {
     python3 -c "import json; print(json.load(open('$1'))['$2'])"
 }
 
-read_config_or_default() {
-    python3 -c "import json; data=json.load(open('$1')); print(data.get('$2', '$3'))"
+read_config_default() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import json
+import sys
+
+path, key, default = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    d = json.load(f)
+print(d.get(key, default))
+PY
 }
 
 GPU_NUM=$(read_config "$TRAIN_CONFIG" gpu_num)
@@ -31,10 +39,10 @@ EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)
 GRAD_ACC=$(read_config "$TRAIN_CONFIG" grad_acc)
 LR=$(read_config "$TRAIN_CONFIG" lr)
-MAX_STEPS=$(read_config_or_default "$TRAIN_CONFIG" max_steps -1)
-SAVE_STEPS=$(read_config_or_default "$TRAIN_CONFIG" save_steps 2)
-MODEL_MAX_LENGTH=$(read_config_or_default "$TRAIN_CONFIG" model_max_length 512)
-NUM_WORKERS=$(read_config_or_default "$TRAIN_CONFIG" dataloader_num_workers 0)
+MAX_STEPS=$(read_config_default "$TRAIN_CONFIG" max_steps -1)
+SAVE_STEPS=$(read_config_default "$TRAIN_CONFIG" save_steps 50000)
+MODEL_MAX_LENGTH=$(read_config_default "$TRAIN_CONFIG" model_max_length 2048)
+DATALOADER_NUM_WORKERS=$(read_config_default "$TRAIN_CONFIG" dataloader_num_workers 4)
 
 GPU_LIST=""
 for i in $(seq 0 $((GPU_NUM-1))); do
@@ -42,12 +50,24 @@ for i in $(seq 0 $((GPU_NUM-1))); do
 done
 GPU_LIST=${GPU_LIST%,}
 
+MASTER_PORT="${MASTER_PORT:-9001}"
+
 ################## LLaMA-2 ##################
 # PROMPT_VERSION="llava_llama_2"
 # MODEL_VERSION="Llama-2-7b-chat-hf"
 ################## LLaMA-2 ##################
 
-deepspeed --include localhost:$GPU_LIST --master_port 9001 llava/train/train_mem_MOE.py \
+EXTRA_ARGS=""
+if [ "$MAX_STEPS" -gt 0 ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --max_steps $MAX_STEPS"
+fi
+
+DEEPSPEED_RUNNER="${DEEPSPEED_RUNNER:-deepspeed}"
+if ! command -v "$DEEPSPEED_RUNNER" >/dev/null 2>&1; then
+    DEEPSPEED_RUNNER="python3 -m deepspeed"
+fi
+
+$DEEPSPEED_RUNNER --include localhost:$GPU_LIST --master_port "$MASTER_PORT" llava/train/train_mem_MOE.py \
     --deepspeed ./scripts/zero2.json \
     --lora_enable True --lora_r $RANK --lora_alpha $((RANK * 2)) --mm_projector_lr 2e-5 \
     --expert_num $EXPERT \
@@ -68,14 +88,12 @@ deepspeed --include localhost:$GPU_LIST --master_port 9001 llava/train/train_mem
     --output_dir $OUTPUT_DIR \
     --cur_task $CUR_TASK \
     --num_train_epochs $EPOCH \
-    --max_steps $MAX_STEPS \
     --per_device_train_batch_size $BATCH_SIZE \
     --per_device_eval_batch_size 16 \
     --gradient_accumulation_steps $GRAD_ACC \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
     --save_steps $SAVE_STEPS \
-    --save_total_limit 1 \
     --learning_rate $LR \
     --weight_decay 0. \
     --warmup_ratio 0.03 \
@@ -84,6 +102,7 @@ deepspeed --include localhost:$GPU_LIST --master_port 9001 llava/train/train_mem
     --tf32 True \
     --model_max_length $MODEL_MAX_LENGTH \
     --gradient_checkpointing True \
-    --dataloader_num_workers $NUM_WORKERS \
+    --dataloader_num_workers $DATALOADER_NUM_WORKERS \
     --lazy_preprocess True \
-    --report_to none
+    --report_to none \
+    $EXTRA_ARGS

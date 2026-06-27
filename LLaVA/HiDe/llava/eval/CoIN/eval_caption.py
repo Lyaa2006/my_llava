@@ -2,9 +2,10 @@ import os
 import argparse
 import json
 import re
+import shutil
 from openai import OpenAI
 from multiprocessing import Pool, cpu_count
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction, corpus_bleu
 from nltk.translate.meteor_score import meteor_score
 from collections import Counter
 from collections import defaultdict
@@ -76,30 +77,138 @@ def merge_captions(pred_file, val_file, output_file):
     with open(output_file, "w", encoding="utf-8") as f:
         json.dump(merged_data, f, indent=4, ensure_ascii=False)
 
+def load_coco(annotation_file):
+    with open(annotation_file, "r", encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    anns = dataset.get("annotations", [])
+    has_missing_category_id = any(isinstance(ann, dict) and "category_id" not in ann for ann in anns)
+    if "categories" in dataset and has_missing_category_id:
+        dataset = dict(dataset)
+        dataset.pop("categories", None)
+
+    coco = COCO()
+    coco.dataset = dataset
+    coco.createIndex()
+    return coco
+
+def simple_tokenize(text):
+    if text is None:
+        return []
+    return re.findall(r"[A-Za-z0-9]+|[^\sA-Za-z0-9]", str(text).lower())
+
+def lcs_length(a, b):
+    if not a or not b:
+        return 0
+    dp = [0] * (len(b) + 1)
+    for x in a:
+        prev = 0
+        for j, y in enumerate(b, start=1):
+            tmp = dp[j]
+            if x == y:
+                dp[j] = prev + 1
+            else:
+                dp[j] = max(dp[j], dp[j - 1])
+            prev = tmp
+    return dp[-1]
+
+def rouge_l_f1(hyp_tokens, ref_tokens, beta=1.2):
+    if not hyp_tokens or not ref_tokens:
+        return 0.0
+    lcs = lcs_length(hyp_tokens, ref_tokens)
+    if lcs == 0:
+        return 0.0
+    prec = lcs / len(hyp_tokens)
+    rec = lcs / len(ref_tokens)
+    denom = rec + (beta * beta) * prec
+    if denom == 0:
+        return 0.0
+    return ((1 + beta * beta) * prec * rec) / denom
+
+def safe_meteor(references, hypothesis):
+    try:
+        return float(meteor_score(references, hypothesis))
+    except Exception:
+        return 0.0
+
+def eval_with_python_metrics(coco, output_file, total):
+    preds = load_json(output_file)
+
+    references = []
+    hypotheses = []
+    meteor_scores = []
+    rouge_scores = []
+
+    for item in preds:
+        image_id = item.get("image_id")
+        hyp = item.get("caption", "")
+        anns = coco.imgToAnns.get(image_id, [])
+        refs = [ann.get("caption", "") for ann in anns if isinstance(ann, dict)]
+        if not refs:
+            continue
+
+        references.append([simple_tokenize(r) for r in refs])
+        hypotheses.append(simple_tokenize(hyp))
+        meteor_scores.append(safe_meteor(refs, hyp))
+        hyp_toks = simple_tokenize(hyp)
+        rouge_scores.append(max((rouge_l_f1(hyp_toks, simple_tokenize(r)) for r in refs), default=0.0))
+
+    if not hypotheses:
+        bleu_1 = bleu_2 = bleu_3 = bleu_4 = 0.0
+        meteor = 0.0
+        rouge_l = 0.0
+    else:
+        smoother = SmoothingFunction().method1
+        bleu_1 = corpus_bleu(references, hypotheses, weights=(1, 0, 0, 0), smoothing_function=smoother)
+        bleu_2 = corpus_bleu(references, hypotheses, weights=(0.5, 0.5, 0, 0), smoothing_function=smoother)
+        bleu_3 = corpus_bleu(references, hypotheses, weights=(1 / 3, 1 / 3, 1 / 3, 0), smoothing_function=smoother)
+        bleu_4 = corpus_bleu(references, hypotheses, weights=(0.25, 0.25, 0.25, 0.25), smoothing_function=smoother)
+        meteor = sum(meteor_scores) / len(meteor_scores) if meteor_scores else 0.0
+        rouge_l = sum(rouge_scores) / len(rouge_scores) if rouge_scores else 0.0
+
+    cider = 0.0
+    return {
+        "Bleu_1": bleu_1,
+        "Bleu_2": bleu_2,
+        "Bleu_3": bleu_3,
+        "Bleu_4": bleu_4,
+        "METEOR": meteor,
+        "ROUGE_L": rouge_l,
+        "CIDEr": cider,
+    }
+
 def eval_single(output_file, annotation_file, total):
-    coco = COCO(annotation_file)  # Ground truth JSON file
+    coco = load_coco(annotation_file)  # Ground truth JSON file
     coco_res = coco.loadRes(output_file)  # Prediction JSON file
 
-    coco_eval = COCOEvalCap(coco, coco_res)
-
-    coco_eval.evaluate()
-
     metrics_to_print = ["Bleu_1", "Bleu_2", "Bleu_3", "Bleu_4", "METEOR", "ROUGE_L", "CIDEr"]
-    results = []
-    for metric, score in coco_eval.eval.items():
-        if metric in metrics_to_print:
-            score_percentage = score * 100.
-            print(f"{metric}: {score_percentage:.2f}")
-            results.append(score_percentage)
-        
+    eval_dict = None
 
-    print('Samples: {}\nAverage: {:.2f}%\n'.format(total, sum(results) / len(results)))
+    if shutil.which("java") is None:
+        eval_dict = eval_with_python_metrics(coco, output_file, total)
+    else:
+        try:
+            coco_eval = COCOEvalCap(coco, coco_res)
+            coco_eval.evaluate()
+            eval_dict = coco_eval.eval
+        except FileNotFoundError:
+            eval_dict = eval_with_python_metrics(coco, output_file, total)
+
+    results = []
+    for metric in metrics_to_print:
+        score = float(eval_dict.get(metric, 0.0))
+        score_percentage = score * 100.0
+        print(f"{metric}: {score_percentage:.2f}")
+        results.append(score_percentage)
+
+    avg = sum(results) / len(results) if results else 0.0
+    print('Samples: {}\nAverage: {:.2f}%\n'.format(total, avg))
     #将结果写入文件
     if args.output_dir is not None:
         output_file = os.path.join(args.output_dir, 'Result.text')
         with open(output_file, 'w') as f:
             f.write('Samples: {}\nBleu_1: {:.2f}\nBleu_2: {:.2f}\nBleu_3: {:.2f}\nBleu_4: {:.2f}\nMETEOR: {:.2f}\nROUGE_L: {:.2f}\nCIDEr: {:.2f}\nAverage: {:.2f}\n'.format(
-                total, results[0], results[1], results[2], results[3], results[4], results[5], results[6], sum(results) / len(results)))
+                total, results[0], results[1], results[2], results[3], results[4], results[5], results[6], avg))
     
 
 def process_batch(api_key, batch):

@@ -1,7 +1,7 @@
 {
   "gpu_num": 1,
-  "rank": 8,
-  "expert_num": 2,
+  "rank": 12,
+  "expert_num": 6,
   "previous_model": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task5_llava_lora",
   "output_dir": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task6_llava_lora",
   "epoch": 1,
@@ -11,6 +11,6 @@
   "cur_task": 5,
   "max_steps": 2,
   "save_steps": 2,
-  "model_max_length": 512,
+  "model_max_length": 1024,
   "dataloader_num_workers": 0
 }

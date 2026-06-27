@@ -1,16 +1,14 @@
 {
   "gpu_num": 1,
-  "rank": 8,
-  "expert_num": 2,
-  "previous_model": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task3_llava_lora",
+  "rank": 12,
+  "expert_num": 6,
+  "previous_model": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task2_llava_lora",
   "output_dir": "/mnt/lyaa/my_llava/checkpoint/UCIT/LLaVA-1.5/HiDe/Task4_llava_lora",
   "epoch": 1,
   "batch_size": 1,
   "grad_acc": 1,
   "lr": 2e-4,
   "cur_task": 3,
-  "max_steps": 2,
-  "save_steps": 2,
-  "model_max_length": 512,
+  "model_max_length": 1024,
   "dataloader_num_workers": 0
 }

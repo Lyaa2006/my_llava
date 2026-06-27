@@ -37,6 +37,23 @@ def eval_model(args):
     with open(os.path.expanduser(args.question_file), "r") as f:
         questions = json.load(f)
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
+    max_samples_env = os.environ.get("UCIT_MAX_SAMPLES", "").strip()
+    max_samples = args.max_samples
+    if max_samples_env:
+        try:
+            max_samples = int(max_samples_env)
+        except ValueError:
+            pass
+    if max_samples is not None and max_samples > 0:
+        questions = questions[:max_samples]
+
+    max_new_tokens_env = os.environ.get("UCIT_MAX_NEW_TOKENS", "").strip()
+    max_new_tokens = 256
+    if max_new_tokens_env:
+        try:
+            max_new_tokens = int(max_new_tokens_env)
+        except ValueError:
+            pass
     
     answers_file = os.path.expanduser(args.answers_file)
     os.makedirs(os.path.dirname(answers_file), exist_ok=True)
@@ -77,7 +94,7 @@ def eval_model(args):
                 top_p=args.top_p,
                 num_beams=args.num_beams,
                 # no_repeat_ngram_size=3,
-                max_new_tokens=256,
+                max_new_tokens=max_new_tokens,
                 use_cache=True)
 
         input_token_len = input_ids.shape[1]
@@ -115,6 +132,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--text-tower", type=str)
     parser.add_argument("--num-task", type=int, default=0)
+    parser.add_argument("--max-samples", type=int, default=-1)
     args = parser.parse_args()
 
     eval_model(args)

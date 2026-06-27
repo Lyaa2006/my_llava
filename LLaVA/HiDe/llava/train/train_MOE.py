@@ -35,9 +35,7 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 
-sys.path.append('/mnt/lyaa/MCITlib/LLaVA/HiDe')
-
-from HiDe.peft import PeftModel, TaskType, get_peft_model, HiDeMOELoraConfig, WEIGHTS_NAME, set_peft_model_state_dict
+from HiDe.peft import TaskType, get_peft_model, HiDeMOELoraConfig, WEIGHTS_NAME, set_peft_model_state_dict
 
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -654,6 +652,16 @@ class LazySupervisedDataset(Dataset):
             
             random.shuffle(list_data_dict)
 
+        max_train_samples_env = os.environ.get("UCIT_MAX_TRAIN_SAMPLES", "").strip()
+        if max_train_samples_env:
+            try:
+                max_train_samples = int(max_train_samples_env)
+            except ValueError:
+                max_train_samples = -1
+            if max_train_samples > 0 and len(list_data_dict) > max_train_samples:
+                random.shuffle(list_data_dict)
+                list_data_dict = list_data_dict[:max_train_samples]
+
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
         self.list_data_dict = list_data_dict
@@ -838,6 +846,11 @@ def train():
         if 'mpt' in model_args.model_name_or_path:
             config = transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True)
             config.attn_config['attn_impl'] = training_args.mpt_attn_impl
+            config.mm_vision_tower = model_args.vision_tower
+            config.mm_text_tower = getattr(model_args, "text_tower", None) or model_args.vision_tower
+            config.mm_vision_select_layer = model_args.mm_vision_select_layer
+            config.mm_vision_select_feature = model_args.mm_vision_select_feature
+            config.mm_text_select_layer = model_args.mm_text_select_layer
             model = LlavaMPTForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
                 config=config,
@@ -845,8 +858,18 @@ def train():
                 **bnb_model_from_pretrained_args
             )
         else:
+            config = transformers.AutoConfig.from_pretrained(
+                model_args.model_name_or_path,
+                cache_dir=training_args.cache_dir,
+            )
+            config.mm_vision_tower = model_args.vision_tower
+            config.mm_text_tower = getattr(model_args, "text_tower", None) or model_args.vision_tower
+            config.mm_vision_select_layer = model_args.mm_vision_select_layer
+            config.mm_vision_select_feature = model_args.mm_vision_select_feature
+            config.mm_text_select_layer = model_args.mm_text_select_layer
             model = LlavaLlamaForCausalLM.from_pretrained(
                 model_args.model_name_or_path,
+                config=config,
                 cache_dir=training_args.cache_dir,
                 **bnb_model_from_pretrained_args,
             )
