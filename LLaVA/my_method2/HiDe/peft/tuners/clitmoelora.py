@@ -38,6 +38,12 @@ from ..import_utils import is_bnb_4bit_available, is_bnb_available
 if is_bnb_available():
     import bitsandbytes as bnb
 
+def is_last_decoder_layer(layer) -> bool:
+    try:
+        return int(layer) == 31
+    except (TypeError, ValueError):
+        return False
+
 @dataclass
 class HiDeMOELoraConfig(LoraConfig):
     """
@@ -351,7 +357,6 @@ class HiDeMOELoraLinear(nn.Linear, HiDeMOELoraLayer):
         self.update_layer(adapter_name, r, lora_alpha, lora_dropout, init_lora_weights)
         self.active_adapter = adapter_name
 
-
     def merge(self):
         if self.active_adapter not in self.lora_A.keys():
             return
@@ -409,7 +414,7 @@ class HiDeMOELoraLinear(nn.Linear, HiDeMOELoraLayer):
                 lora_b_output = self.lora_B[self.active_adapter].loraB[self.cur_task](lora_a_output)
                 result += lora_b_output * self.scaling[self.active_adapter]
             else:
-                if int(self.layer) != 31:
+                if not is_last_decoder_layer(self.layer):
                     lora_a_output = self.lora_A[self.active_adapter](self.lora_dropout[self.active_adapter](x))
                     lora_b_output = self.lora_B[self.active_adapter](lora_a_output)
                     result += lora_b_output * self.scaling[self.active_adapter]
@@ -460,10 +465,12 @@ class HiDeMOELinearA(nn.Module):
             return output
         else:
             merge_weight = 1.0
-            if int(self.layer) != 31:
-                temp_mlp = nn.Linear(self.in_features, self.r, bias=False).to(x.device)
-                
-                fused_weight = torch.zeros((self.r, self.in_features), device=x.device)
+            if not is_last_decoder_layer(self.layer):
+                temp_mlp = nn.Linear(self.in_features, self.r, bias=False).to(
+                    device=x.device, dtype=x.dtype
+                )
+
+                fused_weight = torch.zeros((self.r, self.in_features), device=x.device, dtype=x.dtype)
             
                 for i in range(self.cur_task + 1):
                     fused_weight += merge_weight * self.loraA[i].weight
@@ -512,10 +519,12 @@ class HiDeMOELinearB(nn.Module):
             output = self.loraB[self.cur_task](x)
         else:
             merge_weight = 1.0
-            if int(self.layer) != 31:
-                temp_mlp = nn.Linear(self.r, self.out_features, bias=False).to(x.device)
-                
-                fused_weight = torch.zeros((self.out_features, self.r), device=x.device)
+            if not is_last_decoder_layer(self.layer):
+                temp_mlp = nn.Linear(self.r, self.out_features, bias=False).to(
+                    device=x.device, dtype=x.dtype
+                )
+
+                fused_weight = torch.zeros((self.out_features, self.r), device=x.device, dtype=x.dtype)
             
                 for i in range(self.cur_task + 1):
                     fused_weight += merge_weight * self.loraB[i].weight

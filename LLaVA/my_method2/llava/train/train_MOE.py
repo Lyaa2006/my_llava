@@ -16,7 +16,7 @@
 
 import os
 import copy
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import json, deepspeed
@@ -139,7 +139,35 @@ def move_model_to_training_device(model, training_args):
             mm_projector.to(device=device, dtype=dtype)
 
 
-def extract_description_cache_backbone(model, tokenizer, data_args, training_args):
+@contextmanager
+def temporary_description_snapshot(model, adapter_name: Optional[str], cur_task: int):
+    wrapped = getattr(model, "module", model)
+    prev_training = model.training
+    prev_adapter = getattr(wrapped, "active_adapter", None)
+    prev_task = getattr(wrapped, "cur_task", None)
+
+    try:
+        model.eval()
+        if adapter_name is not None and hasattr(wrapped, "set_adapter"):
+            wrapped.set_adapter(adapter_name)
+        if hasattr(wrapped, "cur_task"):
+            wrapped.cur_task = int(cur_task)
+        yield
+    finally:
+        if prev_task is not None and hasattr(wrapped, "cur_task"):
+            try:
+                wrapped.cur_task = prev_task
+            except Exception:
+                pass
+        if prev_adapter is not None and hasattr(wrapped, "set_adapter"):
+            try:
+                wrapped.set_adapter(prev_adapter)
+            except Exception:
+                pass
+        model.train(prev_training)
+
+
+def extract_description_cache_snapshot(model, tokenizer, data_args, training_args):
     if data_args.description_cache_dir is None:
         raise ValueError("`description_cache_dir` is required when extracting description cache.")
     os.makedirs(data_args.description_cache_dir, exist_ok=True)
@@ -156,17 +184,20 @@ def extract_description_cache_backbone(model, tokenizer, data_args, training_arg
     loader = DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
 
     wrapped = getattr(model, "module", model)
-    disable_adapter_ctx = nullcontext()
-    if hasattr(wrapped, "disable_adapter"):
-        disable_adapter_ctx = wrapped.disable_adapter()
+    snapshot_task = int(getattr(wrapped, "cur_task", 0)) - 1
+    if snapshot_task < 0:
+        raise ValueError("Description cache extraction requires at least one learned historical task snapshot.")
+    snapshot_adapter = getattr(wrapped, "prev_task_adapter_name", None)
+    if snapshot_adapter is not None and hasattr(wrapped, "peft_config"):
+        if snapshot_adapter not in getattr(wrapped, "peft_config", {}):
+            snapshot_adapter = None
 
     use_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if use_dist else 0
     world_size = torch.distributed.get_world_size() if use_dist else 1
 
-    model.eval()
     cached = 0
-    with torch.no_grad(), disable_adapter_ctx:
+    with torch.no_grad(), temporary_description_snapshot(model, snapshot_adapter, snapshot_task):
         for batch in loader:
             if "description_input_ids" not in batch:
                 continue
@@ -219,7 +250,9 @@ def extract_description_cache_backbone(model, tokenizer, data_args, training_arg
             "description_prompt": data_args.description_prompt,
             "description_hidden_layer": int(training_args.description_hidden_layer),
             "description_max_tokens": int(training_args.description_max_tokens),
-            "teacher": "backbone_only",
+            "teacher": "historical_snapshot_fuse",
+            "snapshot_cur_task": int(snapshot_task),
+            "snapshot_adapter": snapshot_adapter or getattr(wrapped, "active_adapter", None),
             "entries": int(len(cache_entries)),
             "total": int(len(train_dataset)),
             "world_size": int(world_size),
@@ -230,7 +263,7 @@ def extract_description_cache_backbone(model, tokenizer, data_args, training_arg
     data_args.load_description_cache = prev_load_description_cache
 
 
-def maybe_sync_description_cache_settings(data_args, training_args):
+def maybe_sync_description_cache_settings(data_args, training_args, model_args=None):
     if not training_args.enable_description_cl or data_args.description_cache_dir is None:
         return
 
@@ -240,6 +273,25 @@ def maybe_sync_description_cache_settings(data_args, training_args):
 
     with open(meta_path, "r") as f:
         cache_meta = json.load(f)
+
+    cached_teacher = cache_meta.get("teacher")
+    expected_teacher = "historical_snapshot_fuse"
+    if cached_teacher != expected_teacher:
+        raise ValueError(
+            f"Description cache at {meta_path} was built with teacher={cached_teacher!r}, "
+            f"but {expected_teacher!r} is required. Please regenerate the cache."
+        )
+
+    expected_snapshot_task = None
+    if model_args is not None and getattr(model_args, "cur_task", None) is not None:
+        expected_snapshot_task = int(model_args.cur_task) - 1
+    if expected_snapshot_task is not None and expected_snapshot_task >= 0:
+        cached_snapshot_task = cache_meta.get("snapshot_cur_task")
+        if cached_snapshot_task != expected_snapshot_task:
+            raise ValueError(
+                f"Description cache at {meta_path} targets snapshot_cur_task={cached_snapshot_task!r}, "
+                f"but current run expects {expected_snapshot_task}. Please regenerate or switch cache_dir."
+            )
 
     cached_max_tokens = cache_meta.get("description_max_tokens")
     if cached_max_tokens is not None and cached_max_tokens != training_args.description_max_tokens:
@@ -1140,7 +1192,7 @@ def train():
         raise ValueError("`enable_description_cl=True` requires `description_cache_dir`.")
     if training_args.extract_description_cache_only and data_args.description_cache_dir is None:
         raise ValueError("`extract_description_cache_only=True` requires `description_cache_dir`.")
-    maybe_sync_description_cache_settings(data_args, training_args)
+    maybe_sync_description_cache_settings(data_args, training_args, model_args)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
     
@@ -1346,11 +1398,11 @@ def train():
         # load model from previous task
         load_model_from_previous_task(model, model_args.previous_task_model_path)
     elif training_args.enable_description_cl or training_args.extract_description_cache_only:
-        raise ValueError("`previous_task_model_path` is required for offline backbone description cache.")
+        raise ValueError("`previous_task_model_path` is required for offline historical snapshot description cache.")
 
     if training_args.extract_description_cache_only:
         move_model_to_training_device(model, training_args)
-        extract_description_cache_backbone(model, tokenizer, data_args, training_args)
+        extract_description_cache_snapshot(model, tokenizer, data_args, training_args)
         return
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
