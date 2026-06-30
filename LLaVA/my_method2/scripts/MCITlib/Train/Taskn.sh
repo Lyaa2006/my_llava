@@ -9,6 +9,10 @@ MODEL_CONFIG=$1
 DATA_CONFIG=$2
 TRAIN_CONFIG=$3
 
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(realpath "$SCRIPT_DIR/../../..")"
+cd "$PROJECT_ROOT"
+
 read_config() {
     python3 -c "import json; print(json.load(open('$1'))['$2'])"
 }
@@ -29,11 +33,16 @@ GPU_NUM=$(read_config "$TRAIN_CONFIG" gpu_num)
 RANK=$(read_config "$TRAIN_CONFIG" rank)
 EXPERT=$(read_config "$TRAIN_CONFIG" expert_num)
 MODEL_NAME=$(read_config "$MODEL_CONFIG" model_name)
-PREVIOUS=$(read_config "$TRAIN_CONFIG" previous_model)
+PREVIOUS="${PREVIOUS:-$(read_config "$TRAIN_CONFIG" previous_model)}"
 DATA_PATH=$(read_config "$DATA_CONFIG" train_path)
 IMAGE=$(read_config "$DATA_CONFIG" train_folder)
 VISION_TOWER=$(read_config "$MODEL_CONFIG" vision_tower)
 OUTPUT_DIR=$(read_config "$TRAIN_CONFIG" output_dir)
+if [ -n "${UCIT_TASK_OUTPUT_DIR_OVERRIDE:-}" ]; then
+    OUTPUT_DIR="$UCIT_TASK_OUTPUT_DIR_OVERRIDE"
+elif [ -n "${UCIT_OUTPUT_DIR_OVERRIDE:-}" ]; then
+    OUTPUT_DIR="$UCIT_OUTPUT_DIR_OVERRIDE"
+fi
 CUR_TASK=$(read_config "$TRAIN_CONFIG" cur_task)
 EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)
@@ -102,8 +111,24 @@ DESCRIPTION_MAX_TOKENS=${DESCRIPTION_MAX_TOKENS:-"32"}
 DESCRIPTION_ALIGN_WEIGHT=${DESCRIPTION_ALIGN_WEIGHT:-"1.0"}
 DESCRIPTION_UTILITY_WEIGHT=${DESCRIPTION_UTILITY_WEIGHT:-"1.0"}
 STANDARD_CE_WEIGHT=${STANDARD_CE_WEIGHT:-"1.0"}
+ENABLE_LAYERWISE_AUX_LOSS=${ENABLE_LAYERWISE_AUX_LOSS:-"False"}
+AUX_EXCLUDE_LAST_N_LAYERS=${AUX_EXCLUDE_LAST_N_LAYERS:-"4"}
+DESCRIPTION_ALIGN_LOSS_CAP=${DESCRIPTION_ALIGN_LOSS_CAP:-"-1.0"}
+DESCRIPTION_UTILITY_LOSS_CAP=${DESCRIPTION_UTILITY_LOSS_CAP:-"-1.0"}
 DESCRIPTION_CACHE_DIR=${DESCRIPTION_CACHE_DIR:-"$OUTPUT_DIR/description_cache"}
 DESCRIPTION_EXTRACT_CACHE=${DESCRIPTION_EXTRACT_CACHE:-"0"}
+DESCRIPTION_CACHE_MODE=${DESCRIPTION_CACHE_MODE:-"snapshot"}
+SKIP_BAD_BATCHES=${SKIP_BAD_BATCHES:-"True"}
+MAX_CONSECUTIVE_BAD_BATCHES=${MAX_CONSECUTIVE_BAD_BATCHES:-"200"}
+DEBUG_FORCE_BAD_BATCH_STEP=${DEBUG_FORCE_BAD_BATCH_STEP:-"-1"}
+
+case "$DESCRIPTION_CACHE_MODE" in
+    snapshot|static_backbone) ;;
+    *)
+        echo "ERROR: DESCRIPTION_CACHE_MODE must be 'snapshot' or 'static_backbone'." >&2
+        exit 1
+        ;;
+esac
 
 EXTRA_ARGS=""
 if [ "$MAX_STEPS" -gt 0 ]; then
@@ -115,47 +140,92 @@ DS_INCLUDE_ARGS="--include localhost:$GPU_LIST"
 
 if [ "$DESCRIPTION_EXTRACT_CACHE" = "1" ]; then
     CACHE_MASTER_PORT="${CACHE_MASTER_PORT:-$((MASTER_PORT + 100))}"
-    deepspeed $DS_INCLUDE_ARGS --master_port "$CACHE_MASTER_PORT" llava/train/train_mem_MOE.py \
-        --deepspeed ./scripts/zero2.json \
-        --lora_enable True --lora_r $RANK --lora_alpha $((RANK * 2)) --mm_projector_lr 2e-5 \
-        --expert_num $EXPERT \
-        --model_name_or_path $MODEL_NAME \
-        --previous_task_model_path $PREVIOUS \
-        --version $PROMPT_VERSION \
-        --data_path $DATA_PATH \
-        --image_folder $IMAGE \
-        --vision_tower $VISION_TOWER \
-        --text_tower $VISION_TOWER \
-        --mm_projector_type mlp2x_gelu \
-        --mm_vision_select_layer -2 \
-        --mm_use_im_start_end False \
-        --mm_use_im_patch_token False \
-        --image_aspect_ratio pad \
-        --group_by_modality_length True \
-        --bf16 True \
-        --output_dir /tmp/description_cache_only \
-        --cur_task $CUR_TASK \
-        --per_device_train_batch_size 1 \
-        --gradient_accumulation_steps 1 \
-        --evaluation_strategy "no" \
-        --save_strategy "no" \
-        --learning_rate $LR \
-        --weight_decay 0. \
-        --warmup_ratio 0.03 \
-        --lr_scheduler_type "cosine" \
-        --logging_steps 1 \
-        --tf32 True \
-        --model_max_length $MODEL_MAX_LENGTH \
-        --gradient_checkpointing False \
-        --dataloader_num_workers 0 \
-        --lazy_preprocess True \
-        --extract_description_cache_only True \
-        --description_cache_dir "$DESCRIPTION_CACHE_DIR" \
-        --description_prompt "$DESCRIPTION_PROMPT" \
-        --description_hidden_layer $DESCRIPTION_HIDDEN_LAYER \
-        --description_max_tokens $DESCRIPTION_MAX_TOKENS \
-        --report_to none \
-        $EXTRA_ARGS
+    if [ "$DESCRIPTION_CACHE_MODE" = "snapshot" ]; then
+        deepspeed $DS_INCLUDE_ARGS --master_port "$CACHE_MASTER_PORT" llava/train/train_mem_MOE.py \
+            --deepspeed ./scripts/zero2.json \
+            --lora_enable True --lora_r $RANK --lora_alpha $((RANK * 2)) --mm_projector_lr 2e-5 \
+            --expert_num $EXPERT \
+            --model_name_or_path $MODEL_NAME \
+            --previous_task_model_path $PREVIOUS \
+            --version $PROMPT_VERSION \
+            --data_path $DATA_PATH \
+            --image_folder $IMAGE \
+            --vision_tower $VISION_TOWER \
+            --text_tower $VISION_TOWER \
+            --mm_projector_type mlp2x_gelu \
+            --mm_vision_select_layer -2 \
+            --mm_use_im_start_end False \
+            --mm_use_im_patch_token False \
+            --image_aspect_ratio pad \
+            --group_by_modality_length True \
+            --bf16 True \
+            --output_dir /tmp/description_cache_only \
+            --cur_task $CUR_TASK \
+            --per_device_train_batch_size 1 \
+            --gradient_accumulation_steps 1 \
+            --evaluation_strategy "no" \
+            --save_strategy "no" \
+            --learning_rate $LR \
+            --weight_decay 0. \
+            --warmup_ratio 0.03 \
+            --lr_scheduler_type "cosine" \
+            --logging_steps 1 \
+            --tf32 True \
+            --model_max_length $MODEL_MAX_LENGTH \
+            --gradient_checkpointing False \
+            --dataloader_num_workers 0 \
+            --lazy_preprocess True \
+            --extract_description_cache_only True \
+            --description_cache_dir "$DESCRIPTION_CACHE_DIR" \
+            --description_prompt "$DESCRIPTION_PROMPT" \
+            --description_hidden_layer $DESCRIPTION_HIDDEN_LAYER \
+            --description_max_tokens $DESCRIPTION_MAX_TOKENS \
+            --description_cache_generation_mode "$DESCRIPTION_CACHE_MODE" \
+            --report_to none \
+            $EXTRA_ARGS
+    else
+        deepspeed $DS_INCLUDE_ARGS --master_port "$CACHE_MASTER_PORT" llava/train/train_mem_MOE.py \
+            --deepspeed ./scripts/zero2.json \
+            --lora_enable False \
+            --expert_num $EXPERT \
+            --model_name_or_path $MODEL_NAME \
+            --version $PROMPT_VERSION \
+            --data_path $DATA_PATH \
+            --image_folder $IMAGE \
+            --vision_tower $VISION_TOWER \
+            --text_tower $VISION_TOWER \
+            --mm_projector_type mlp2x_gelu \
+            --mm_vision_select_layer -2 \
+            --mm_use_im_start_end False \
+            --mm_use_im_patch_token False \
+            --image_aspect_ratio pad \
+            --group_by_modality_length True \
+            --bf16 True \
+            --output_dir /tmp/description_cache_only \
+            --cur_task $CUR_TASK \
+            --per_device_train_batch_size 1 \
+            --gradient_accumulation_steps 1 \
+            --evaluation_strategy "no" \
+            --save_strategy "no" \
+            --learning_rate $LR \
+            --weight_decay 0. \
+            --warmup_ratio 0.03 \
+            --lr_scheduler_type "cosine" \
+            --logging_steps 1 \
+            --tf32 True \
+            --model_max_length $MODEL_MAX_LENGTH \
+            --gradient_checkpointing False \
+            --dataloader_num_workers 0 \
+            --lazy_preprocess True \
+            --extract_description_cache_only True \
+            --description_cache_dir "$DESCRIPTION_CACHE_DIR" \
+            --description_prompt "$DESCRIPTION_PROMPT" \
+            --description_hidden_layer $DESCRIPTION_HIDDEN_LAYER \
+            --description_max_tokens $DESCRIPTION_MAX_TOKENS \
+            --description_cache_generation_mode "$DESCRIPTION_CACHE_MODE" \
+            --report_to none \
+            $EXTRA_ARGS
+    fi
 fi
 
 deepspeed $DS_INCLUDE_ARGS --master_port "$MASTER_PORT" llava/train/train_mem_MOE.py \
@@ -203,5 +273,12 @@ deepspeed $DS_INCLUDE_ARGS --master_port "$MASTER_PORT" llava/train/train_mem_MO
     --description_align_weight $DESCRIPTION_ALIGN_WEIGHT \
     --description_utility_weight $DESCRIPTION_UTILITY_WEIGHT \
     --standard_ce_weight $STANDARD_CE_WEIGHT \
+    --enable_layerwise_aux_loss $ENABLE_LAYERWISE_AUX_LOSS \
+    --aux_exclude_last_n_layers $AUX_EXCLUDE_LAST_N_LAYERS \
+    --description_align_loss_cap $DESCRIPTION_ALIGN_LOSS_CAP \
+    --description_utility_loss_cap $DESCRIPTION_UTILITY_LOSS_CAP \
+    --skip_bad_batches $SKIP_BAD_BATCHES \
+    --max_consecutive_bad_batches $MAX_CONSECUTIVE_BAD_BATCHES \
+    --debug_force_bad_batch_step $DEBUG_FORCE_BAD_BATCH_STEP \
     --report_to none \
     $EXTRA_ARGS

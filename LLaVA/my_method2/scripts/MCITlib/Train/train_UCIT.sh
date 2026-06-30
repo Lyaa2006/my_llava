@@ -39,7 +39,9 @@ if [ "$UCIT_SMOKE" = "1" ]; then
     export UCIT_MAX_TRAIN_SAMPLES="${UCIT_MAX_TRAIN_SAMPLES:-8}"
     export UCIT_MAX_SAMPLES="${UCIT_MAX_SAMPLES:-8}"
     export UCIT_MAX_NEW_TOKENS="${UCIT_MAX_NEW_TOKENS:-64}"
-    if [ -z "$UCIT_TASKS" ] && [ "$UCIT_TASK_SET" != "all" ]; then
+    if [ -n "${UCIT_SMOKE_TASKS:-}" ]; then
+        UCIT_TASKS="$UCIT_SMOKE_TASKS"
+    elif [ -z "$UCIT_TASKS" ] && [ "$UCIT_TASK_SET" != "all" ]; then
         UCIT_TASKS="1,2"
     fi
     UCIT_EVAL_MODE="${UCIT_EVAL_MODE:-final}"
@@ -108,6 +110,7 @@ echo "UCIT task set: $UCIT_TASK_SET"
 echo "UCIT train config root: $TRAIN_CONFIG_ROOT"
 echo "UCIT eval config root: $EVAL_CONFIG_ROOT"
 echo "UCIT only: $UCIT_ONLY"
+echo "UCIT smoke tasks override: ${UCIT_SMOKE_TASKS:-<unset>}"
 echo "UCIT tasks: ${UCIT_TASKS:-<range>}"
 echo "UCIT eval mode: $UCIT_EVAL_MODE"
 echo "UCIT reinstall between tasks: $UCIT_REINSTALL_BETWEEN_TASKS"

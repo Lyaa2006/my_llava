@@ -34,6 +34,11 @@ DATA_PATH=$(read_config "$DATA_CONFIG" train_path)
 IMAGE=$(read_config "$DATA_CONFIG" train_folder)
 VISION_TOWER=$(read_config "$MODEL_CONFIG" vision_tower)
 OUTPUT_DIR=$(read_config "$TRAIN_CONFIG" output_dir)
+if [ -n "${UCIT_TASK1_OUTPUT_DIR_OVERRIDE:-}" ]; then
+    OUTPUT_DIR="$UCIT_TASK1_OUTPUT_DIR_OVERRIDE"
+elif [ -n "${UCIT_OUTPUT_DIR_OVERRIDE:-}" ]; then
+    OUTPUT_DIR="$UCIT_OUTPUT_DIR_OVERRIDE"
+fi
 CUR_TASK=$(read_config "$TRAIN_CONFIG" cur_task)
 EPOCH=$(read_config "$TRAIN_CONFIG" epoch)
 BATCH_SIZE=$(read_config "$TRAIN_CONFIG" batch_size)

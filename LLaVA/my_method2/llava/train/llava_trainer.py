@@ -1,6 +1,8 @@
 import os
+import re
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 from contextlib import nullcontext
 from contextlib import contextmanager
 
@@ -15,9 +17,19 @@ from transformers.trainer import (
     ShardedDDPOption,
     logger,
 )
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX
+
+try:
+    from transformers.trainer import smp_forward_backward
+except ImportError:
+    smp_forward_backward = None
+
+try:
+    from apex import amp
+except ImportError:
+    amp = None
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -133,6 +145,14 @@ class LengthGroupedSampler(Sampler):
         else:
             indices = get_length_grouped_indices(self.lengths, self.batch_size, self.world_size, generator=self.generator)
         return iter(indices)
+
+
+class BadBatchError(RuntimeError):
+    pass
+
+
+_LAYER_INDEX_PATTERN = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+_EXPERT_INDEX_PATTERN = re.compile(r"(?:^|\.)lora[AB]\.(\d+)(?:\.|$)")
 
 
 @contextmanager
@@ -260,6 +280,340 @@ class LLaVATrainer(Trainer):
                     logger.info(f"skipped: {skipped/2**20}M params")
 
         return self.optimizer
+
+    def _sync_skip_flag(self, local_skip: bool, device: torch.device) -> bool:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return local_skip
+        skip_tensor = torch.tensor(1 if local_skip else 0, device=device, dtype=torch.int32)
+        torch.distributed.all_reduce(skip_tensor, op=torch.distributed.ReduceOp.MAX)
+        return bool(skip_tensor.item())
+
+    def _summarize_batch(self, inputs: Dict[str, Any]) -> str:
+        parts = []
+        attention_mask = inputs.get("attention_mask")
+        if torch.is_tensor(attention_mask) and attention_mask.ndim == 2:
+            lengths = attention_mask.long().sum(dim=1).tolist()
+            parts.append(f"text_lens={lengths}")
+        labels = inputs.get("labels")
+        if torch.is_tensor(labels):
+            valid_counts = labels.ne(IGNORE_INDEX).long().sum(dim=1).tolist()
+            parts.append(f"valid_label_counts={valid_counts}")
+        description_attention_mask = inputs.get("description_attention_mask")
+        if torch.is_tensor(description_attention_mask) and description_attention_mask.ndim == 2:
+            desc_lengths = description_attention_mask.long().sum(dim=1).tolist()
+            parts.append(f"description_lens={desc_lengths}")
+        if "images" in inputs:
+            images = inputs["images"]
+            if torch.is_tensor(images):
+                parts.append(f"images_shape={tuple(images.shape)}")
+            elif isinstance(images, list):
+                parts.append(f"images_list_len={len(images)}")
+        cache_keys = inputs.get("description_cache_keys")
+        if isinstance(cache_keys, list) and cache_keys:
+            parts.append(f"cache_keys={cache_keys[:2]}")
+        return " ".join(parts)
+
+    def _record_bad_batch(self, message: str):
+        total = int(getattr(self, "_bad_batch_total", 0)) + 1
+        consecutive = int(getattr(self, "_bad_batch_consecutive", 0)) + 1
+        self._bad_batch_total = total
+        self._bad_batch_consecutive = consecutive
+        if self.args.local_rank in (-1, 0):
+            step = int(getattr(self.state, "global_step", 0))
+            print(
+                f"[bad-batch][step={step}][total_skipped={total}][consecutive={consecutive}] {message}",
+                flush=True,
+            )
+        max_consecutive = int(getattr(self.args, "max_consecutive_bad_batches", 20) or 20)
+        if consecutive > max_consecutive:
+            raise RuntimeError(
+                f"Skipped {consecutive} consecutive bad batches, exceeding max_consecutive_bad_batches={max_consecutive}."
+            )
+
+    def _reset_bad_batch_streak(self):
+        self._bad_batch_consecutive = 0
+
+    def _ensure_finite_loss(self, name: str, value: torch.Tensor, inputs: Dict[str, Any]):
+        if torch.is_tensor(value) and not torch.isfinite(value.detach()).all():
+            raise BadBatchError(f"{name} became non-finite. {self._summarize_batch(inputs)}")
+
+    def _resolve_num_hidden_layers(self, model) -> Optional[int]:
+        wrapped = getattr(model, "module", model)
+        for candidate in (
+            getattr(getattr(wrapped, "config", None), "num_hidden_layers", None),
+            getattr(getattr(wrapped, "config", None), "n_layer", None),
+            getattr(getattr(wrapped, "config", None), "num_layers", None),
+        ):
+            if candidate is None:
+                continue
+            try:
+                candidate = int(candidate)
+            except (TypeError, ValueError):
+                continue
+            if candidate > 0:
+                return candidate
+
+        max_layer_idx = -1
+        for name, _ in wrapped.named_parameters():
+            match = _LAYER_INDEX_PATTERN.search(name)
+            if match is None:
+                continue
+            max_layer_idx = max(max_layer_idx, int(match.group(1)))
+        if max_layer_idx >= 0:
+            return max_layer_idx + 1
+        return None
+
+    def _should_mask_aux_grad(self, param_name: str, target_expert: int, layer_cutoff: int) -> bool:
+        expert_match = _EXPERT_INDEX_PATTERN.search(param_name)
+        if expert_match is None:
+            return False
+        if int(expert_match.group(1)) != int(target_expert):
+            return False
+        layer_match = _LAYER_INDEX_PATTERN.search(param_name)
+        if layer_match is None:
+            return False
+        return int(layer_match.group(1)) >= int(layer_cutoff)
+
+    @contextmanager
+    def _temporary_aux_grad_mask(self, model):
+        wrapped = getattr(model, "module", model)
+        if not getattr(self.args, "enable_layerwise_aux_loss", False):
+            yield
+            return
+
+        cur_task = getattr(wrapped, "cur_task", None)
+        if cur_task is None:
+            yield
+            return
+
+        exclude_last_n_layers = int(getattr(self.args, "aux_exclude_last_n_layers", 0) or 0)
+        if exclude_last_n_layers <= 0:
+            yield
+            return
+
+        num_hidden_layers = self._resolve_num_hidden_layers(model)
+        if num_hidden_layers is None:
+            yield
+            return
+
+        layer_cutoff = max(0, num_hidden_layers - exclude_last_n_layers)
+        hooks = []
+
+        def _zero_aux_grad(grad):
+            if grad is None:
+                return None
+            return torch.zeros_like(grad)
+
+        try:
+            for name, param in wrapped.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if self._should_mask_aux_grad(name, int(cur_task), layer_cutoff):
+                    hooks.append(param.register_hook(_zero_aux_grad))
+            yield
+        finally:
+            for hook in hooks:
+                try:
+                    hook.remove()
+                except Exception:
+                    pass
+
+    def _cap_loss_value(self, loss: torch.Tensor, cap: float):
+        if cap is None or float(cap) <= 0:
+            return loss
+        return torch.clamp(loss, max=float(cap))
+
+    def _compute_description_loss_bundle(self, model, inputs):
+        standard_outputs = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            labels=inputs["labels"],
+            images=inputs.get("images"),
+            return_dict=True,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+        standard_loss = standard_outputs.loss
+        self._ensure_finite_loss("standard_loss", standard_loss, inputs)
+
+        if "reference_description_states" not in inputs or "reference_description_mask" not in inputs:
+            raise ValueError("Description continual-learning loss requires offline cached backbone reference description states.")
+
+        current_states, current_mask = self._extract_description_states(
+            model,
+            inputs,
+            disable_adapter=False,
+            disable_anchor_update=True,
+        )
+        reference_states = inputs["reference_description_states"].to(current_states.device)
+        reference_mask = inputs["reference_description_mask"].to(current_states.device)
+        shared_seq_len = min(current_states.shape[1], reference_states.shape[1])
+        current_states = current_states[:, :shared_seq_len]
+        current_mask = current_mask[:, :shared_seq_len]
+        reference_states = reference_states[:, :shared_seq_len]
+        reference_mask = reference_mask[:, :shared_seq_len]
+
+        valid_mask = current_mask & reference_mask
+        diff = (current_states.float() - reference_states.float()) ** 2
+        mask_f = valid_mask.unsqueeze(-1).float()
+        description_align_loss_raw = (diff * mask_f).sum() / (mask_f.sum().clamp_min(1.0) * current_states.shape[-1])
+        self._ensure_finite_loss("description_align_loss", description_align_loss_raw, inputs)
+
+        description_align_loss = self._cap_loss_value(description_align_loss_raw, self.args.description_align_loss_cap)
+        utility_weight = float(getattr(self.args, "description_utility_weight", 0.0) or 0.0)
+        if utility_weight != 0.0:
+            description_utility_loss_raw = self._compute_description_utility_loss(model, inputs, reference_states, reference_mask)
+            self._ensure_finite_loss("description_utility_loss", description_utility_loss_raw, inputs)
+            description_utility_loss = self._cap_loss_value(description_utility_loss_raw, self.args.description_utility_loss_cap)
+        else:
+            description_utility_loss_raw = None
+            description_utility_loss = None
+        total_loss = (
+            self.args.standard_ce_weight * standard_loss
+            + self.args.description_align_weight * description_align_loss
+            + (utility_weight * description_utility_loss if description_utility_loss is not None else 0.0)
+        )
+        self._ensure_finite_loss("total_loss", total_loss, inputs)
+
+        bundle = {
+            "standard_outputs": standard_outputs,
+            "standard_loss": standard_loss,
+            "description_align_loss_raw": description_align_loss_raw,
+            "description_align_loss": description_align_loss,
+            "description_utility_loss_raw": description_utility_loss_raw,
+            "description_utility_loss": description_utility_loss,
+            "total_loss": total_loss,
+        }
+        return bundle
+
+    def _log_loss_bundle(self, bundle: Dict[str, torch.Tensor], cur_task):
+        if self.args.local_rank not in (-1, 0) or getattr(self, "state", None) is None:
+            return
+
+        def _to_float(value):
+            if value is None:
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            if torch.is_tensor(value):
+                return float(value.detach().float().mean().cpu())
+            return None
+
+        def _finite_flag(value):
+            if value is None:
+                return "none"
+            if torch.is_tensor(value):
+                finite = torch.isfinite(value.detach()).all().item()
+                return "finite" if finite else "nonfinite"
+            if isinstance(value, (int, float)):
+                return "finite" if float(value) == float(value) and abs(float(value)) != float("inf") else "nonfinite"
+            return "unknown"
+
+        step = int(getattr(self.state, "global_step", 0))
+        print(
+            f"[loss][step={step}][cur_task={cur_task}] "
+            f"standard_ce={_to_float(bundle['standard_loss'])}({_finite_flag(bundle['standard_loss'])}) "
+            f"description_align_raw={_to_float(bundle['description_align_loss_raw'])}({_finite_flag(bundle['description_align_loss_raw'])}) "
+            f"description_align={_to_float(bundle['description_align_loss'])}({_finite_flag(bundle['description_align_loss'])}) "
+            f"description_utility_raw={_to_float(bundle['description_utility_loss_raw'])}({_finite_flag(bundle['description_utility_loss_raw'])}) "
+            f"description_utility={_to_float(bundle['description_utility_loss'])}({_finite_flag(bundle['description_utility_loss'])}) "
+            f"total={_to_float(bundle['total_loss'])}({_finite_flag(bundle['total_loss'])})",
+            flush=True,
+        )
+
+    def _backward_loss(self, loss: torch.Tensor):
+        if self.do_grad_scaling:
+            self.scaler.scale(loss).backward()
+        elif self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        if is_sagemaker_mp_enabled():
+            loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
+            return loss_mb.reduce_mean().detach().to(self.args.device)
+
+        local_skip = False
+        local_reason = ""
+        loss = None
+        bundle = None
+        layerwise_aux_enabled = bool(getattr(self.args, "enable_layerwise_aux_loss", False))
+        force_bad_step = int(getattr(self.args, "debug_force_bad_batch_step", -1) or -1)
+        current_step = int(getattr(self.state, "global_step", 0))
+        if (
+            force_bad_step >= 0
+            and current_step == force_bad_step
+            and not getattr(self, "_debug_forced_bad_batch_done", False)
+        ):
+            self._debug_forced_bad_batch_done = True
+            local_skip = True
+            local_reason = f"BadBatchError: debug_force_bad_batch_step={force_bad_step}"
+
+        if not local_skip:
+            try:
+                with self.compute_loss_context_manager():
+                    if (
+                        layerwise_aux_enabled
+                        and "description_input_ids" in inputs
+                        and getattr(getattr(model, "module", model), "cur_task", None) is not None
+                        and int(getattr(getattr(model, "module", model), "cur_task", 0)) > 0
+                    ):
+                        bundle = self._compute_description_loss_bundle(model, inputs)
+                        loss = bundle["total_loss"]
+                    else:
+                        loss = self.compute_loss(model, inputs)
+                if torch.is_tensor(loss) and not torch.isfinite(loss.detach()).all():
+                    raise BadBatchError(f"total_loss became non-finite. {self._summarize_batch(inputs)}")
+            except Exception as exc:
+                if not getattr(self.args, "skip_bad_batches", True):
+                    raise
+                local_skip = True
+                local_reason = f"{type(exc).__name__}: {exc}"
+
+        sync_device = self.args.device
+        if torch.is_tensor(loss):
+            sync_device = loss.device
+        elif "labels" in inputs and torch.is_tensor(inputs["labels"]):
+            sync_device = inputs["labels"].device
+        should_skip = self._sync_skip_flag(local_skip, sync_device)
+
+        if should_skip:
+            if local_skip:
+                self._record_bad_batch(local_reason)
+            elif self.args.local_rank in (-1, 0):
+                self._record_bad_batch("Skipped because another rank reported a bad batch.")
+            return torch.zeros((), device=sync_device)
+
+        self._reset_bad_batch_streak()
+
+        if self.args.n_gpu > 1 and torch.is_tensor(loss):
+            loss = loss.mean()
+
+        if not layerwise_aux_enabled or bundle is None:
+            self._backward_loss(loss)
+            return loss.detach() / self.args.gradient_accumulation_steps
+
+        self._log_loss_bundle(bundle, cur_task=getattr(getattr(model, "module", model), "cur_task", None))
+
+        self._backward_loss(bundle["standard_loss"] * self.args.standard_ce_weight)
+
+        aux_backprops = []
+        if float(self.args.description_align_weight) != 0.0:
+            aux_backprops.append(bundle["description_align_loss"] * self.args.description_align_weight)
+        if bundle.get("description_utility_loss") is not None and float(self.args.description_utility_weight) != 0.0:
+            aux_backprops.append(bundle["description_utility_loss"] * self.args.description_utility_weight)
+
+        if aux_backprops:
+            with self._temporary_aux_grad_mask(model):
+                for aux_loss in aux_backprops:
+                    self._backward_loss(aux_loss)
+
+        return loss.detach() / self.args.gradient_accumulation_steps
 
     def _pad_description_sequences(self, sequences, dtype=None):
         max_len = max(seq.shape[0] for seq in sequences)
@@ -476,112 +830,19 @@ class LLaVATrainer(Trainer):
                 return super().compute_loss(model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch)
             except TypeError:
                 return super().compute_loss(model, inputs, return_outputs=return_outputs)
-
-        standard_outputs = model(
-            input_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
-            labels=inputs["labels"],
-            images=inputs.get("images"),
-            return_dict=True,
-            output_hidden_states=False,
-            use_cache=False,
-        )
-        standard_loss = standard_outputs.loss
-        if torch.is_tensor(standard_loss) and not torch.isfinite(standard_loss.detach()).all():
-            logits = getattr(standard_outputs, "logits", None)
-            labels = inputs.get("labels")
-            if torch.is_tensor(logits) and torch.is_tensor(labels) and logits.ndim == 3 and labels.ndim == 2:
-                shift_logits = logits[..., :-1, :].contiguous()
-                shift_labels = labels[..., 1:].contiguous().to(device=shift_logits.device)
-                valid = shift_labels.ne(IGNORE_INDEX)
-                valid_count = int(valid.sum().item())
-                if valid_count > 0:
-                    denom = shift_logits.new_tensor(float(valid_count))
-                    ce_sum = F.cross_entropy(
-                        shift_logits.view(-1, shift_logits.size(-1)),
-                        shift_labels.view(-1),
-                        ignore_index=IGNORE_INDEX,
-                        reduction="sum",
-                    )
-                    standard_loss = ce_sum / denom
-                else:
-                    standard_loss = shift_logits.new_zeros(())
-            else:
-                standard_loss = torch.nan_to_num(standard_loss, nan=0.0, posinf=0.0, neginf=0.0)
-
-        if "reference_description_states" not in inputs or "reference_description_mask" not in inputs:
-            raise ValueError("Description continual-learning loss requires offline cached backbone reference description states.")
-
-        current_states, current_mask = self._extract_description_states(
-            model,
-            inputs,
-            disable_adapter=False,
-            disable_anchor_update=True,
-        )
-        reference_states = inputs["reference_description_states"].to(current_states.device)
-        reference_mask = inputs["reference_description_mask"].to(current_states.device)
-        shared_seq_len = min(current_states.shape[1], reference_states.shape[1])
-        current_states = current_states[:, :shared_seq_len]
-        current_mask = current_mask[:, :shared_seq_len]
-        reference_states = reference_states[:, :shared_seq_len]
-        reference_mask = reference_mask[:, :shared_seq_len]
-
-        valid_mask = current_mask & reference_mask
-        diff = (current_states.float() - reference_states.float()) ** 2
-        mask_f = valid_mask.unsqueeze(-1).float()
-        description_align_loss = (diff * mask_f).sum() / (mask_f.sum().clamp_min(1.0) * current_states.shape[-1])
-
-        description_utility_loss = self._compute_description_utility_loss(model, inputs, reference_states, reference_mask)
-
-        total_loss = (
-            self.args.description_align_weight * description_align_loss
-            + self.args.description_utility_weight * description_utility_loss
-            + self.args.standard_ce_weight * standard_loss
-        )
-
-        if self.args.local_rank in (-1, 0) and getattr(self, "state", None) is not None:
-            def _to_float(value):
-                if value is None:
-                    return None
-                if isinstance(value, (int, float)):
-                    return float(value)
-                if torch.is_tensor(value):
-                    return float(value.detach().float().mean().cpu())
-                return None
-
-            def _finite_flag(value):
-                if value is None:
-                    return "none"
-                if torch.is_tensor(value):
-                    finite = torch.isfinite(value.detach()).all().item()
-                    return "finite" if finite else "nonfinite"
-                if isinstance(value, (int, float)):
-                    return "finite" if float(value) == float(value) and abs(float(value)) != float("inf") else "nonfinite"
-                return "unknown"
-
-            step = int(getattr(self.state, "global_step", 0))
-            ce_v = _to_float(standard_loss)
-            align_v = _to_float(description_align_loss)
-            util_v = _to_float(description_utility_loss)
-            total_v = _to_float(total_loss)
-            print(
-                f"[loss][step={step}][cur_task={cur_task}] "
-                f"standard_ce={ce_v}({ _finite_flag(standard_loss) }) "
-                f"description_align={align_v}({ _finite_flag(description_align_loss) }) "
-                f"description_utility={util_v}({ _finite_flag(description_utility_loss) }) "
-                f"total={total_v}({ _finite_flag(total_loss) })",
-                flush=True,
-            )
-
+        bundle = self._compute_description_loss_bundle(model, inputs)
+        self._log_loss_bundle(bundle, cur_task=cur_task)
         if return_outputs:
             outputs = {
-                "standard_outputs": standard_outputs,
-                "standard_loss": standard_loss.detach(),
-                "description_utility_loss": description_utility_loss.detach(),
-                "description_align_loss": description_align_loss.detach(),
+                "standard_outputs": bundle["standard_outputs"],
+                "standard_loss": bundle["standard_loss"].detach(),
+                "description_align_loss_raw": bundle["description_align_loss_raw"].detach(),
+                "description_align_loss": bundle["description_align_loss"].detach(),
+                "description_utility_loss_raw": bundle["description_utility_loss_raw"].detach(),
+                "description_utility_loss": bundle["description_utility_loss"].detach(),
             }
-            return total_loss, outputs
-        return total_loss
+            return bundle["total_loss"], outputs
+        return bundle["total_loss"]
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

@@ -78,6 +78,7 @@ def eval_model(args):
                 num_beams=args.num_beams,
                 # no_repeat_ngram_size=3,
                 max_new_tokens=256,
+                stopping_criteria=[stopping_criteria],
                 use_cache=True)
 
         input_token_len = input_ids.shape[1]

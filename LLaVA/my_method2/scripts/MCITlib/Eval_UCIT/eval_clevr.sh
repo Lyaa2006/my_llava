@@ -18,6 +18,9 @@ NUM_TASK=$(read_config "$TRAIN_CONFIG" num_task)
 DATA_PATH=$(read_config "$DATA_CONFIG" test_path)
 IMAGE=$(read_config "$DATA_CONFIG" test_folder)
 RESULT_PATH=$(read_config "$TRAIN_CONFIG" result_path)
+if [ -n "${UCIT_RESULT_PATH_OVERRIDE:-}" ]; then
+    RESULT_PATH="$UCIT_RESULT_PATH_OVERRIDE"
+fi
 
 gpu_list=""
 for ((i=0; i<GPU_NUM; i++)); do

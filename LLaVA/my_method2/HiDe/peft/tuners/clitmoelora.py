@@ -68,7 +68,6 @@ class HiDeMOELoraModel(LoraModel):
         self.peft_config = config
         self.add_adapter(adapter_name, self.peft_config[adapter_name])
         self.expert_weight = [0., 0., 0., 0., 0., 0., 0., 0.]
-        print(self.model.training)
 
     def add_adapter(self, adapter_name, config=None):
         if config is not None:  # get the lora config

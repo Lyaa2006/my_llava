@@ -54,6 +54,8 @@ MODEL_TYPE_TO_PEFT_MODEL_MAPPING = {
     "QUESTION_ANS": PeftModelForQuestionAnswering,
     "FEATURE_EXTRACTION": PeftModelForFeatureExtraction,
     "CAUSAL_LM_CoIN": PeftModelForCausalLMLORAMOE,
+    # Backward-compatible alias used by existing HiDe/MoE-LoRA checkpoints.
+    "CAUSAL_LM_HiDe": PeftModelForCausalLMLORAMOE,
 }
 
 PEFT_TYPE_TO_CONFIG_MAPPING = {
@@ -65,6 +67,8 @@ PEFT_TYPE_TO_CONFIG_MAPPING = {
     "ADALORA": AdaLoraConfig,
     "IA3": IA3Config,
     "MOE_LORA_CoIN": CoINMOELoraConfig,
+    # Backward-compatible alias used by existing HiDe/MoE-LoRA checkpoints.
+    "MOE_LORA_HiDe": CoINMOELoraConfig,
 }
 
 

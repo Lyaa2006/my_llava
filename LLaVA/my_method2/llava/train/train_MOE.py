@@ -167,7 +167,7 @@ def temporary_description_snapshot(model, adapter_name: Optional[str], cur_task:
         model.train(prev_training)
 
 
-def extract_description_cache_snapshot(model, tokenizer, data_args, training_args):
+def _extract_description_cache(model, tokenizer, data_args, training_args, cache_generation_mode: str):
     if data_args.description_cache_dir is None:
         raise ValueError("`description_cache_dir` is required when extracting description cache.")
     os.makedirs(data_args.description_cache_dir, exist_ok=True)
@@ -184,20 +184,33 @@ def extract_description_cache_snapshot(model, tokenizer, data_args, training_arg
     loader = DataLoader(train_dataset, batch_size=1, shuffle=False, collate_fn=data_collator)
 
     wrapped = getattr(model, "module", model)
-    snapshot_task = int(getattr(wrapped, "cur_task", 0)) - 1
-    if snapshot_task < 0:
+    current_task = int(getattr(wrapped, "cur_task", 0))
+    snapshot_task = current_task - 1
+    if cache_generation_mode == "snapshot" and snapshot_task < 0:
         raise ValueError("Description cache extraction requires at least one learned historical task snapshot.")
-    snapshot_adapter = getattr(wrapped, "prev_task_adapter_name", None)
-    if snapshot_adapter is not None and hasattr(wrapped, "peft_config"):
-        if snapshot_adapter not in getattr(wrapped, "peft_config", {}):
-            snapshot_adapter = None
+
+    cache_generation_mode = str(cache_generation_mode).strip().lower()
+    if cache_generation_mode == "snapshot":
+        snapshot_adapter = getattr(wrapped, "prev_task_adapter_name", None)
+        if snapshot_adapter is not None and hasattr(wrapped, "peft_config"):
+            if snapshot_adapter not in getattr(wrapped, "peft_config", {}):
+                snapshot_adapter = None
+        cache_ctx = temporary_description_snapshot(model, snapshot_adapter, snapshot_task)
+    elif cache_generation_mode == "static_backbone":
+        snapshot_adapter = None
+        cache_ctx = temporary_description_snapshot(model, None, current_task)
+    else:
+        raise ValueError(
+            f"Unsupported description cache generation mode: {cache_generation_mode!r}. "
+            "Expected 'snapshot' or 'static_backbone'."
+        )
 
     use_dist = torch.distributed.is_available() and torch.distributed.is_initialized()
     rank = torch.distributed.get_rank() if use_dist else 0
     world_size = torch.distributed.get_world_size() if use_dist else 1
 
     cached = 0
-    with torch.no_grad(), temporary_description_snapshot(model, snapshot_adapter, snapshot_task):
+    with torch.no_grad(), cache_ctx:
         for batch in loader:
             if "description_input_ids" not in batch:
                 continue
@@ -250,7 +263,9 @@ def extract_description_cache_snapshot(model, tokenizer, data_args, training_arg
             "description_prompt": data_args.description_prompt,
             "description_hidden_layer": int(training_args.description_hidden_layer),
             "description_max_tokens": int(training_args.description_max_tokens),
+            # Keep the legacy label so task2 cache validation accepts both cache variants.
             "teacher": "historical_snapshot_fuse",
+            "cache_source": cache_generation_mode,
             "snapshot_cur_task": int(snapshot_task),
             "snapshot_adapter": snapshot_adapter or getattr(wrapped, "active_adapter", None),
             "entries": int(len(cache_entries)),
@@ -261,6 +276,14 @@ def extract_description_cache_snapshot(model, tokenizer, data_args, training_arg
             json.dump(meta, f, indent=2)
     data_args.use_description_data = prev_use_description_data
     data_args.load_description_cache = prev_load_description_cache
+
+
+def extract_description_cache_snapshot(model, tokenizer, data_args, training_args):
+    return _extract_description_cache(model, tokenizer, data_args, training_args, "snapshot")
+
+
+def extract_description_cache_static_backbone(model, tokenizer, data_args, training_args):
+    return _extract_description_cache(model, tokenizer, data_args, training_args, "static_backbone")
 
 
 def maybe_sync_description_cache_settings(data_args, training_args, model_args=None):
@@ -389,11 +412,24 @@ class TrainingArguments(transformers.TrainingArguments):
     group_by_modality_length: bool = field(default=False)
     enable_description_cl: bool = field(default=False)
     extract_description_cache_only: bool = field(default=False)
+    description_cache_generation_mode: str = field(
+        default="snapshot",
+        metadata={
+            "help": "Description cache generation mode. Use 'snapshot' for the loaded HiDe snapshot or 'static_backbone' for the frozen base VLM."
+        },
+    )
     description_hidden_layer: int = field(default=-2)
     description_max_tokens: int = field(default=32)
     description_align_weight: float = field(default=1.0)
     description_utility_weight: float = field(default=1.0)
     standard_ce_weight: float = field(default=1.0)
+    enable_layerwise_aux_loss: bool = field(default=False)
+    aux_exclude_last_n_layers: int = field(default=4)
+    description_align_loss_cap: float = field(default=-1.0)
+    description_utility_loss_cap: float = field(default=-1.0)
+    skip_bad_batches: bool = field(default=True)
+    max_consecutive_bad_batches: int = field(default=200)
+    debug_force_bad_batch_step: int = field(default=-1)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -1181,6 +1217,15 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    cache_generation_mode = str(getattr(training_args, "description_cache_generation_mode", "snapshot")).strip().lower()
+    if cache_generation_mode not in {"snapshot", "static_backbone"}:
+        raise ValueError(
+            f"Unsupported description_cache_generation_mode={cache_generation_mode!r}. "
+            "Expected 'snapshot' or 'static_backbone'."
+        )
+    training_args.description_cache_generation_mode = cache_generation_mode
+    if cache_generation_mode == "static_backbone" and training_args.extract_description_cache_only:
+        model_args.expert_num = 1
     data_args.use_description_data = training_args.enable_description_cl or training_args.extract_description_cache_only
     if training_args.enable_description_cl and training_args.gradient_checkpointing:
         rank0_print(
@@ -1394,15 +1439,30 @@ def train():
     model.set_tokenizer(tokenizer)
     model.set_cur_task(model_args.cur_task, model_args.expert_num)
 
-    if model_args.previous_task_model_path is not None:
+    load_previous_task = model_args.previous_task_model_path is not None
+    if training_args.extract_description_cache_only and cache_generation_mode == "static_backbone":
+        if model_args.previous_task_model_path is not None:
+            raise ValueError(
+                "`previous_task_model_path` must be omitted when "
+                "`description_cache_generation_mode=static_backbone`."
+            )
+        if training_args.lora_enable:
+            raise ValueError("`static_backbone` description cache extraction requires `lora_enable=False`.")
+        load_previous_task = False
+    if load_previous_task:
         # load model from previous task
         load_model_from_previous_task(model, model_args.previous_task_model_path)
-    elif training_args.enable_description_cl or training_args.extract_description_cache_only:
+    elif training_args.enable_description_cl or (
+        training_args.extract_description_cache_only and cache_generation_mode != "static_backbone"
+    ):
         raise ValueError("`previous_task_model_path` is required for offline historical snapshot description cache.")
 
     if training_args.extract_description_cache_only:
         move_model_to_training_device(model, training_args)
-        extract_description_cache_snapshot(model, tokenizer, data_args, training_args)
+        if cache_generation_mode == "static_backbone":
+            extract_description_cache_static_backbone(model, tokenizer, data_args, training_args)
+        else:
+            extract_description_cache_snapshot(model, tokenizer, data_args, training_args)
         return
 
     data_module = make_supervised_data_module(tokenizer=tokenizer,
